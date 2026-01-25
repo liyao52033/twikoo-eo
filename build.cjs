@@ -22,12 +22,12 @@ const ip2regionOutputPath = path.join(srcDir, 'node-functions/ip2region-data.js'
 if (fs.existsSync(ip2regionDbPath)) {
   const dbBuffer = fs.readFileSync(ip2regionDbPath)
   console.log(`  原始大小: ${(dbBuffer.length / 1024 / 1024).toFixed(2)} MB`)
-  
+
   const compressed = zlib.gzipSync(dbBuffer, { level: 9 })
   console.log(`  压缩后大小: ${(compressed.length / 1024 / 1024).toFixed(2)} MB`)
-  
+
   const base64 = compressed.toString('base64')
-  
+
   const jsContent = `/**
  * ip2region.db 数据（gzip 压缩 + Base64 编码）
  * 自动生成，请勿手动修改
@@ -56,7 +56,7 @@ export function getIp2RegionBuffer() {
 
 export default getIp2RegionBuffer
 `
-  
+
   fs.writeFileSync(ip2regionOutputPath, jsContent)
   console.log(`  ✓ 已生成: node-functions/ip2region-data.js (${(fs.statSync(ip2regionOutputPath).size / 1024 / 1024).toFixed(2)} MB)`)
 } else {
@@ -102,7 +102,6 @@ const requiredFiles = [
   'node-functions/index.js',
   'node-functions/ip2region-searcher.js',
   'node-functions/ip2region-data.js',
-  'edge-functions/api/kv.js',
   'package.json'
 ]
 
@@ -122,14 +121,15 @@ if (allFilesExist) {
   console.log('构建完成！所有文件已就绪。')
   console.log('')
   console.log('项目结构：')
-  console.log('  node-functions/index.js            - Node Function 主入口')
+  console.log('  node-functions/api/index.js        - Node Function 主入口')
   console.log('  node-functions/ip2region-searcher.js - IP 归属地查询器')
   console.log('  node-functions/ip2region-data.js   - IP 数据库（自动生成）')
-  console.log('  edge-functions/api/kv.js           - Edge Function KV API')
   console.log('')
   console.log('部署说明：')
   console.log('  1. 在 EdgeOne Pages 控制台创建项目')
-  console.log('  2. 创建 KV 命名空间并绑定，变量名：TWIKOO_KV')
+  console.log('  2. 配置环境变量：')
+  console.log('     - SUPABASE_URL: Supabase 项目 URL')
+  console.log('     - SUPABASE_SERVICE_ROLE_KEY: Supabase 服务角色密钥')
   console.log('  3. 推送代码触发部署')
 } else {
   console.log('错误：部分必要文件缺失，请检查项目结构')

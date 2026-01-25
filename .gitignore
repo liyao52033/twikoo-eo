@@ -26,3 +26,9 @@ npm-debug.log*
 
 # Lock files
 package-lock.json
+
+# Tencent Cloud EdgeOne
+.env
+.edgeone/*
+.tef_dist/*
+  

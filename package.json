@@ -19,12 +19,13 @@
     "edge-computing"
   ],
   "scripts": {
-    "dev": "edgeone pages dev",
     "build": "node build.cjs",
-    "postinstall": "node build.cjs"
+    "postinstall": "node build.cjs",
+    "deploy": "edgeone pages deploy -n twikoo"
   },
   "dependencies": {
     "@imaegoo/node-ip2region": "^2.1.1",
+    "@supabase/supabase-js": "^2.91.1",
     "bowser": "^2.13.1",
     "pako": "^2.1.0",
     "twikoo-func": "^1.6.44",
