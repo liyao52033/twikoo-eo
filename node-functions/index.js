@@ -9,6 +9,7 @@
 import { v4 as uuidv4 } from 'uuid'
 import xss from 'xss'
 import bowser from 'bowser'
+import { Resend } from 'resend'
 import { createClient } from '@supabase/supabase-js'
 import {
   getMd5,
@@ -126,22 +127,21 @@ setCustomLibs({
                 })
               })
             } else {
-              // 对于其他所有邮件服务，使用 MailChannels API 作为后端
-              // 注意：这仍然需要在 MailChannels 注册并配置 API 密钥
-              response = await fetch('https://api.mailchannels.net/tx/v1/send', {
-                method: 'POST',
-                headers: {
-                  'X-Api-Key': mailConfig.auth.pass,
-                  'Accept': 'application/json',
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                  personalizations: [{ to: [{ email: to }] }],
-                  from: { email: from },
-                  subject,
-                  content: [{ type: 'text/html', value: html }],
-                })
+              // 对于其他所有邮件服务，使用 resend API 作为后端
+              // 注意：这仍然需要在 https://resend.com/  注册并配置 API 密钥
+              const resend = new Resend(mailConfig.auth.pass);
+              const { data, error } = await resend.emails.send({
+                from: mailConfig.auth.user,
+                to: [config.BLOGGER_EMAIL],
+                subject,
+                html
               })
+
+              if (error) {
+                throw new Error(`resend邮件发送失败: ${error.message}`);
+              }
+
+              return data
             }
 
             if (!response) {
@@ -924,13 +924,20 @@ async function commentSubmit(event, req, db, accessToken) {
   // 解析评论数据
   const data = await parseCommentData(event, req, accessToken, ip)
 
+  // 垃圾检测
+  const isSpam = await postCheckSpam(data, config)
+  logger.log('垃圾检测结果：', isSpam)
+  if (isSpam) {
+    throw new Error('评论被检测为垃圾评论，请修改后重新提交')
+  }
+
   // 保存评论
   const result = await db.addComment(data)
   data.id = result.id
   data._id = result.id
   res.id = result.id
 
-  // 异步处理垃圾检测和通知
+  // 异步处理通知
   postSubmit(data, db).catch(e => {
     logger.error('POST_SUBMIT 失败', e.message)
   })
@@ -993,13 +1000,6 @@ async function postSubmit(comment, db) {
         return db.getComment(c.pid)
       }
       return null
-    }
-
-    // 垃圾检测
-    const isSpam = await postCheckSpam(comment, config)
-    if (isSpam && !comment.isSpam) {
-      await db.updateComment(comment._id, { isSpam: true, updated: Date.now() })
-      comment.isSpam = isSpam
     }
 
     // 发送通知
