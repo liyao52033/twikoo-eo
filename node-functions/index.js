@@ -203,7 +203,7 @@ function fixOS(ua) {
  * 获取回复人昵称
  */
 function getRuser(pid, comments = []) {
-  const comment = comments.find((item) => item._id === pid)
+  const comment = comments.find((item) => item.id === pid)
   return comment ? comment.nick : null
 }
 
@@ -225,7 +225,7 @@ function toCommentDto(comment, uid, replies = [], comments = [], cfg) {
   }
   const showRegion = !!cfg.SHOW_REGION && cfg.SHOW_REGION !== 'false'
   return {
-    id: comment._id.toString(),
+    id: comment.id.toString(),
     nick: comment.nick,
     avatar: comment.avatar,
     mailMd5: getMailMd5(comment),
@@ -256,7 +256,7 @@ function parseComment(comments, uid, cfg) {
   for (const comment of comments) {
     if (!comment.rid) {
       const replies = comments
-        .filter((item) => item.rid === comment._id.toString())
+        .filter((item) => item.rid === comment.id.toString())
         .map((item) => toCommentDto(item, uid, [], comments, cfg))
         .sort((a, b) => a.created - b.created)
       result.push(toCommentDto(comment, uid, replies, [], cfg))
@@ -271,6 +271,10 @@ function parseComment(comments, uid, cfg) {
 function parseCommentForAdmin(comments) {
   for (const comment of comments) {
     comment.ipRegion = getIpRegion(comment.ip, true)
+    comment.isParent = !comment.rid
+    if (!comment._id && comment.id) {
+      comment._id = comment.id
+    }
   }
   return comments
 }
@@ -303,12 +307,90 @@ function getIp(req) {
 // ==================== Supabase 代理层 ====================
 
 function createSupabaseProxy(req) {
+  const applyCommentFilters = (q, query) => {
+    let builder = q.eq('type', 'comment')
+
+    if (query.urlIn && query.urlIn.length) {
+      builder = builder.in('url', query.urlIn)
+    }
+
+    if (query.ridIn && query.ridIn.length) {
+      builder = builder.in('rid', query.ridIn)
+    }
+
+    if (query.ridIsNullOrEmpty) {
+      builder = builder.or('rid.is.null,rid.eq.')
+    }
+
+    if (query.topTrue) {
+      builder = builder.eq('top', true)
+    }
+
+    if (query.topFalseOrNull) {
+      builder = builder.or('top.is.null,top.eq.false')
+    }
+
+    if (query.before) {
+      builder = builder.lt('created', query.before)
+    }
+
+    if (query.after) {
+      builder = builder.gt('created', query.after)
+    }
+
+    if (query.ip) {
+      builder = builder.eq('ip', query.ip)
+    }
+
+    if (query.uidEq) {
+      builder = builder.eq('uid', query.uidEq)
+    }
+
+    if (query.spamOnly) {
+      builder = builder.eq('is_spam', true)
+    } else if (query.notSpamOnly) {
+      builder = builder.or('is_spam.is.null,is_spam.eq.false')
+    } else if (query.includeSpam === false) {
+      if (query.uid) {
+        builder = builder.or(`is_spam.is.null,is_spam.eq.false,uid.eq.${query.uid}`)
+      } else {
+        builder = builder.or('is_spam.is.null,is_spam.eq.false')
+      }
+    }
+
+    if (query.keyword) {
+      const safeKeyword = query.keyword
+        .replace(/[,]/g, ' ')
+        .replace(/[%*]/g, ' ')
+        .trim()
+      if (safeKeyword) {
+        builder = builder.or(
+          `nick.ilike.*${safeKeyword}*,mail.ilike.*${safeKeyword}*,link.ilike.*${safeKeyword}*,ip.ilike.*${safeKeyword}*,comment.ilike.*${safeKeyword}*,url.ilike.*${safeKeyword}*,href.ilike.*${safeKeyword}*`
+        )
+      }
+    }
+
+    return builder
+  }
+
   return {
     async getComments(query = {}) {
-      const { data, error } = await supabase
-        .from('twikoo')
-        .select('*')
-        .eq('type', 'comment')
+      let builder = applyCommentFilters(
+        supabase.from('twikoo').select('*'),
+        query
+      )
+
+      if (query.orderByCreatedDesc) {
+        builder = builder.order('created', { ascending: false })
+      }
+
+      if (query.range) {
+        builder = builder.range(query.range.from, query.range.to)
+      } else if (query.limit) {
+        builder = builder.limit(query.limit)
+      }
+
+      const { data, error } = await builder
 
       if (error) {
         logger.error('[Supabase] 获取评论失败:', error.message)
@@ -324,8 +406,17 @@ function createSupabaseProxy(req) {
       }))
     },
     async countComments(query = {}) {
-      const comments = await this.getComments(query)
-      return comments.length
+      const { count, error } = await applyCommentFilters(
+        supabase.from('twikoo').select('id', { count: 'exact', head: true }),
+        query
+      )
+
+      if (error) {
+        logger.error('[Supabase] 统计评论失败:', error.message)
+        throw error
+      }
+
+      return count || 0
     },
     async addComment(comment) {
       // 转换字段名以匹配数据库结构
@@ -377,7 +468,7 @@ function createSupabaseProxy(req) {
       const { error } = await supabase
         .from('twikoo')
         .update(dbUpdates)
-        .eq('_id', id)
+        .eq('id', id)
         .eq('type', 'comment')
 
       if (error) {
@@ -388,11 +479,11 @@ function createSupabaseProxy(req) {
       return { updated: 1 }
     },
     async deleteComment(id) {
-      // 直接使用 _id 字段执行删除操作，因为 _id 存储的是 UUID 格式的字符串，与前端传递的 ID 格式一致
+      // 删除父评论时一并删除其子评论（rid 指向父评论 id）
       const { error } = await supabase
         .from('twikoo')
         .delete()
-        .eq('_id', id)
+        .or(`id.eq.${id},rid.eq.${id}`)
         .eq('type', 'comment')
 
       if (error) {
@@ -406,7 +497,7 @@ function createSupabaseProxy(req) {
       const { data, error } = await supabase
         .from('twikoo')
         .select('*')
-        .eq('_id', id)
+        .eq('id', id)
         .eq('type', 'comment')
         .single()
 
@@ -665,32 +756,44 @@ async function commentGet(event, db, accessToken, req) {
     // 检查管理员权限
     const isAdminUser = await isAdmin(accessToken, req)
 
-    // 获取所有评论
-    let allComments = await db.getComments()
+    // 计算总数（仅主楼，包含当前用户可见范围）
+    let count = 0
+    if (isAdminUser) {
+      count = await db.countComments({
+        urlIn: urlQuery,
+        ridIsNullOrEmpty: true
+      })
+    } else {
+      const countNotSpam = await db.countComments({
+        urlIn: urlQuery,
+        ridIsNullOrEmpty: true,
+        notSpamOnly: true
+      })
+      const countOwnSpam = await db.countComments({
+        urlIn: urlQuery,
+        ridIsNullOrEmpty: true,
+        spamOnly: true,
+        uidEq: uid
+      })
+      count = countNotSpam + countOwnSpam
+    }
 
-    // 过滤主楼评论
-    let mainComments = allComments.filter(c =>
-      urlQuery.includes(c.url) &&
-      (!c.rid || c.rid === '') &&
-      (c.isSpam !== true || c.uid === uid || isAdminUser)
-    )
-
-    // 计算总数
-    const count = mainComments.length
-
-    // 排序
-    mainComments.sort((a, b) => b.created - a.created)
+    // 获取主楼评论（分页）
+    let mainComments = await db.getComments({
+      urlIn: urlQuery,
+      ridIsNullOrEmpty: true,
+      includeSpam: isAdminUser,
+      uid: uid,
+      before: event.before,
+      orderByCreatedDesc: true,
+      limit: limit + 1
+    })
 
     // 处理置顶和分页
     let top = []
     if (!config.TOP_DISABLED && !event.before) {
       top = mainComments.filter(c => c.top === true)
       mainComments = mainComments.filter(c => c.top !== true)
-    }
-
-    // 分页
-    if (event.before) {
-      mainComments = mainComments.filter(c => c.created < event.before)
     }
 
     if (mainComments.length > limit) {
@@ -701,12 +804,15 @@ async function commentGet(event, db, accessToken, req) {
     // 合并置顶
     mainComments = [...top, ...mainComments]
 
-    // 获取回复
-    const mainIds = mainComments.map(c => c._id)
-    const replies = allComments.filter(c =>
-      mainIds.includes(c.rid) &&
-      (c.isSpam !== true || c.uid === uid || isAdminUser)
-    )
+    // 获取回复（仅当前主楼）
+    const mainIds = mainComments.map(c => c.id)
+    const replies = mainIds.length
+      ? (await db.getComments({
+        ridIn: mainIds,
+        includeSpam: isAdminUser,
+        uid: uid
+      }))
+      : []
 
     res.data = parseComment([...mainComments, ...replies], uid, config)
     res.more = more
@@ -726,32 +832,23 @@ async function commentGetForAdmin(event, db, accessToken, req) {
   if (isAdminUser) {
     validate(event, ['per', 'page'])
 
-    let comments = await db.getComments()
+    const query = {
+      orderByCreatedDesc: true,
+      keyword: event.keyword ? event.keyword.toLowerCase() : null
+    }
 
     if (event.type === 'VISIBLE') {
-      comments = comments.filter(c => c.isSpam !== true)
+      query.notSpamOnly = true
     } else if (event.type === 'HIDDEN') {
-      comments = comments.filter(c => c.isSpam === true)
+      query.spamOnly = true
     }
 
-    if (event.keyword) {
-      const keyword = event.keyword.toLowerCase()
-      comments = comments.filter(c =>
-        (c.nick && c.nick.toLowerCase().includes(keyword)) ||
-        (c.mail && c.mail.toLowerCase().includes(keyword)) ||
-        (c.link && c.link.toLowerCase().includes(keyword)) ||
-        (c.ip && c.ip.toLowerCase().includes(keyword)) ||
-        (c.comment && c.comment.toLowerCase().includes(keyword)) ||
-        (c.url && c.url.toLowerCase().includes(keyword)) ||
-        (c.href && c.href.toLowerCase().includes(keyword))
-      )
-    }
-
-    comments.sort((a, b) => b.created - a.created)
-
-    const count = comments.length
+    const count = await db.countComments(query)
     const start = event.per * (event.page - 1)
-    const data = comments.slice(start, start + event.per)
+    const data = await db.getComments({
+      ...query,
+      range: { from: start, to: start + event.per - 1 }
+    })
 
     res.code = RES_CODE.SUCCESS
     res.count = count
@@ -767,8 +864,9 @@ async function commentSetForAdmin(event, db, accessToken, req) {
   const res = {}
   const isAdminUser = await isAdmin(accessToken, req)
   if (isAdminUser) {
-    validate(event, ['id', 'set'])
-    await db.updateComment(event.id, {
+    const targetId = event.id || event._id
+    validate({ ...event, id: targetId }, ['id', 'set'])
+    await db.updateComment(targetId, {
       ...event.set,
       updated: Date.now()
     })
@@ -785,8 +883,9 @@ async function commentDeleteForAdmin(event, db, accessToken, req) {
   const res = {}
   const isAdminUser = await isAdmin(accessToken, req)
   if (isAdminUser) {
-    validate(event, ['id'])
-    await db.deleteComment(event.id)
+    const targetId = event.id || event._id
+    validate({ ...event, id: targetId }, ['id'])
+    await db.deleteComment(targetId)
     res.code = RES_CODE.SUCCESS
     res.deleted = 1
   } else {
@@ -887,9 +986,10 @@ async function readFile(file, type, log) {
 
 async function commentLike(event, db, accessToken) {
   const res = {}
-  validate(event, ['id'])
+  const targetId = event.id || event._id
+  validate({ ...event, id: targetId }, ['id'])
   const uid = accessToken
-  const comment = await db.getComment(event.id)
+  const comment = await db.getComment(targetId)
 
   if (comment) {
     let likes = comment.likes || []
@@ -899,7 +999,7 @@ async function commentLike(event, db, accessToken) {
     } else {
       likes.splice(index, 1)
     }
-    await db.updateComment(event.id, { likes: likes })
+    await db.updateComment(targetId, { likes: likes })
     res.updated = 1
   } else {
     res.updated = 0
@@ -934,7 +1034,6 @@ async function commentSubmit(event, req, db, accessToken) {
   // 保存评论
   const result = await db.addComment(data)
   data.id = result.id
-  data._id = result.id
   res.id = result.id
 
   // 异步处理通知
@@ -957,7 +1056,7 @@ async function parseCommentData(event, req, accessToken, ip) {
   const hashMethod = config.GRAVATAR_CDN === 'cravatar.cn' ? md5 : sha256
 
   const commentDo = {
-    _id: uuidv4().replace(/-/g, ''),
+    id: uuidv4().replace(/-/g, ''),
     uid: accessToken,
     nick: event.nick ? event.nick : '匿名',
     mail: event.mail ? event.mail : '',
@@ -1014,11 +1113,11 @@ async function limitFilter(db, ip) {
   if (Number.isNaN(limitPerMinute)) limitPerMinute = 10
 
   if (limitPerMinute) {
-    const comments = await db.getComments()
-    const recentComments = comments.filter(c =>
-      c.ip === ip && c.created > Date.now() - 600000
-    )
-    if (recentComments.length > limitPerMinute) {
+    const recentCount = await db.countComments({
+      ip: ip,
+      after: Date.now() - 600000
+    })
+    if (recentCount > limitPerMinute) {
       throw new Error('发言频率过高')
     }
   }
@@ -1027,9 +1126,10 @@ async function limitFilter(db, ip) {
   if (Number.isNaN(limitPerMinuteAll)) limitPerMinuteAll = 10
 
   if (limitPerMinuteAll) {
-    const comments = await db.getComments()
-    const recentComments = comments.filter(c => c.created > Date.now() - 600000)
-    if (recentComments.length > limitPerMinuteAll) {
+    const recentCountAll = await db.countComments({
+      after: Date.now() - 600000
+    })
+    if (recentCountAll > limitPerMinuteAll) {
       throw new Error('评论太火爆啦 >_< 请稍后再试')
     }
   }
@@ -1079,14 +1179,18 @@ async function getCommentsCount(event, db) {
   const res = {}
   try {
     validate(event, ['urls'])
-    const comments = await db.getComments()
+    const urlsQuery = getUrlsQuery(event.urls)
+    const comments = await db.getComments({
+      urlIn: urlsQuery,
+      notSpamOnly: true,
+      ridIsNullOrEmpty: event.includeReply ? false : true
+    })
 
     res.data = []
     for (const url of event.urls) {
       const urlVariants = getUrlQuery(url)
       const count = comments.filter(c =>
         urlVariants.includes(c.url) &&
-        c.isSpam !== true &&
         (event.includeReply || !c.rid || c.rid === '')
       ).length
       res.data.push({ url, count })
@@ -1100,26 +1204,21 @@ async function getCommentsCount(event, db) {
 async function getRecentComments(event, db) {
   const res = {}
   try {
-    let comments = await db.getComments()
-
-    comments = comments.filter(c => c.isSpam !== true)
-
-    if (event.urls && event.urls.length) {
-      const urlsQuery = getUrlsQuery(event.urls)
-      comments = comments.filter(c => urlsQuery.includes(c.url))
-    }
-
-    if (!event.includeReply) {
-      comments = comments.filter(c => !c.rid || c.rid === '')
-    }
-
-    comments.sort((a, b) => b.created - a.created)
-
     const pageSize = Math.min(event.pageSize || 10, 100)
-    comments = comments.slice(0, pageSize)
+    const urlsQuery = event.urls && event.urls.length
+      ? getUrlsQuery(event.urls)
+      : null
+
+    let comments = await db.getComments({
+      urlIn: urlsQuery,
+      notSpamOnly: true,
+      ridIsNullOrEmpty: event.includeReply ? false : true,
+      orderByCreatedDesc: true,
+      limit: pageSize
+    })
 
     res.data = comments.map(comment => ({
-      id: comment._id,
+      id: comment.id,
       url: comment.url,
       nick: comment.nick,
       avatar: getAvatar(comment, config),

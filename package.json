@@ -21,7 +21,7 @@
   "scripts": {
     "build": "node build.cjs",
     "postinstall": "node build.cjs",
-    "deploy": "edgeone pages deploy -n twikoo"
+    "deploy": "rm -rf .edgeone && edgeone pages deploy -n twikoo"
   },
   "dependencies": {
     "@imaegoo/node-ip2region": "^2.1.1",
