@@ -45,13 +45,82 @@ import {
   commentImportArtalk2,
   commentImportTwikoo
 } from 'twikoo-func/utils/import'
-import { postCheckSpam } from 'twikoo-func/utils/spam'
+import { postCheckSpam as originalPostCheckSpam } from 'twikoo-func/utils/spam'
 import { sendNotice, emailTest } from 'twikoo-func/utils/notify'
+
+// 包装 postCheckSpam 函数，处理 MANUAL_REVIEW 模式
+async function postCheckSpam(comment, config) {
+  // 如果是人工审核模式，直接返回预检测的结果
+  if (config.AKISMET_KEY === 'MANUAL_REVIEW') {
+    logger.info('人工审核模式，跳过 postCheckSpam，使用预检测结果:', comment.is_spam)
+    return comment.is_spam
+  }
+  return originalPostCheckSpam(comment, config)
+}
 import { uploadImage } from 'twikoo-func/utils/image'
 import constants from 'twikoo-func/utils/constants'
 
 const { RES_CODE } = constants
 const VERSION = '1.6.44'
+
+// 自定义 preCheckSpam 函数，确保人工审核模式正确工作
+function preCheckSpamWithLog(event, config) {
+  logger.info('调用 preCheckSpam，传入配置:', {
+    AKISMET_KEY: config.AKISMET_KEY,
+    LIMIT_LENGTH: config.LIMIT_LENGTH,
+    FORBIDDEN_WORDS: config.FORBIDDEN_WORDS,
+    BLOCKED_WORDS: config.BLOCKED_WORDS
+  })
+
+  try {
+    const { comment, nick } = { comment: event.comment, nick: event.nick }
+
+    // 长度限制
+    let limitLength = parseInt(config.LIMIT_LENGTH)
+    if (Number.isNaN(limitLength)) limitLength = 500
+    if (limitLength && comment.length > limitLength) {
+      throw new Error('评论内容过长')
+    }
+
+    // 屏蔽词检测
+    if (config.BLOCKED_WORDS) {
+      const commentLowerCase = comment.toLowerCase()
+      const nickLowerCase = nick.toLowerCase()
+      for (const blockedWord of config.BLOCKED_WORDS.split(',')) {
+        const blockedWordLowerCase = blockedWord.trim().toLowerCase()
+        if (blockedWordLowerCase && (commentLowerCase.indexOf(blockedWordLowerCase) !== -1 || nickLowerCase.indexOf(blockedWordLowerCase) !== -1)) {
+          throw new Error('包含屏蔽词')
+        }
+      }
+    }
+
+    // 人工审核模式 - 所有评论都标记为需要审核
+    logger.info('检查人工审核模式，AKISMET_KEY:', config.AKISMET_KEY, '是否等于 MANUAL_REVIEW:', config.AKISMET_KEY === 'MANUAL_REVIEW')
+    if (config.AKISMET_KEY === 'MANUAL_REVIEW') {
+      logger.info('已使用人工审核模式，评论审核后才会发表~')
+      return true
+    }
+
+    // 违禁词检测
+    if (config.FORBIDDEN_WORDS) {
+      const commentLowerCase = comment.toLowerCase()
+      const nickLowerCase = nick.toLowerCase()
+      for (const forbiddenWord of config.FORBIDDEN_WORDS.replace(/,+$/, '').split(',')) {
+        const forbiddenWordLowerCase = forbiddenWord.trim().toLowerCase()
+        if (forbiddenWordLowerCase && (commentLowerCase.indexOf(forbiddenWordLowerCase) !== -1 || nickLowerCase.indexOf(forbiddenWordLowerCase) !== -1)) {
+          logger.warn('包含违禁词，直接标记为垃圾评论~')
+          return true
+        }
+      }
+    }
+
+    logger.info('preCheckSpam 执行结果: false，AKISMET_KEY:', config.AKISMET_KEY)
+    return false
+  } catch (error) {
+    logger.error('preCheckSpam 执行出错:', error.message)
+    throw error
+  }
+}
 
 // Supabase 配置
 const SUPABASE_URL = process.env.SUPABASE_URL
@@ -242,7 +311,7 @@ function toCommentDto(comment, uid, replies = [], comments = [], cfg) {
     pid: comment.pid,
     ruser: getRuser(comment.pid, comments),
     top: comment.top,
-    isSpam: comment.is_spam,
+    isSpam: !!(comment.isSpam !== undefined ? comment.isSpam : comment.is_spam), // 确保是布尔值
     created: comment.created,
     updated: comment.updated
   }
@@ -349,10 +418,14 @@ function createSupabaseProxy(req) {
     if (query.spamOnly) {
       builder = builder.eq('is_spam', true)
     } else if (query.notSpamOnly) {
+      // 只查询非垃圾评论 (is_spam is null or is_spam = false)
       builder = builder.or('is_spam.is.null,is_spam.eq.false')
     } else if (query.includeSpam === false) {
+      // 普通用户：显示非垃圾评论，以及自己的垃圾评论
       if (query.uid) {
-        builder = builder.or(`is_spam.is.null,is_spam.eq.false,uid.eq.${query.uid}`)
+        // 正确的逻辑：(is_spam is null OR is_spam = false) OR (is_spam = true AND uid = current_uid)
+        // Supabase 语法：or(is_spam.is.null,is_spam.eq.false,and(is_spam.eq.true,uid.eq.xxx))
+        builder = builder.or(`is_spam.is.null,is_spam.eq.false,and(is_spam.eq.true,uid.eq.${query.uid})`)
       } else {
         builder = builder.or('is_spam.is.null,is_spam.eq.false')
       }
@@ -398,10 +471,11 @@ function createSupabaseProxy(req) {
       }
 
       // 转换字段名以保持与原始代码兼容
+      logger.info('查询到的评论数据:', data.map(item => ({ id: item.id, is_spam: item.is_spam, is_spam_type: typeof item.is_spam, nick: item.nick })))
       return data.map(item => ({
         ...item,
         mailMd5: item.mail_md5,
-        isSpam: item.is_spam,
+        isSpam: item.is_spam === true, // 确保是布尔值
         like: item.likes
       }))
     },
@@ -423,15 +497,17 @@ function createSupabaseProxy(req) {
       const dbComment = {
         ...comment,
         type: 'comment',
-        mail_md5: comment.mailMd5,
-        is_spam: comment.isSpam,
-        likes: comment.like
+        mail_md5: comment.mailMd5 || comment.mail_md5,
+        is_spam: comment.isSpam !== undefined ? comment.isSpam : comment.is_spam,
+        likes: comment.like || comment.likes || []
       }
 
       // 删除不需要的字段
       delete dbComment.mailMd5
       delete dbComment.isSpam
       delete dbComment.like
+
+      logger.info('addComment - 准备插入数据库，is_spam:', dbComment.is_spam, 'type:', typeof dbComment.is_spam)
 
       const { data, error } = await supabase
         .from('twikoo')
@@ -660,6 +736,21 @@ async function readConfig(req) {
   try {
     const db = createSupabaseProxy(req)
     config = await db.getConfig()
+    logger.info('读取配置成功:', JSON.stringify(config))
+
+    // 验证关键配置项
+    if (config.AKISMET_KEY) {
+      logger.info('当前 AKISMET_KEY:', config.AKISMET_KEY)
+    }
+    if (config.LIMIT_LENGTH) {
+      logger.info('当前 LIMIT_LENGTH:', config.LIMIT_LENGTH)
+    }
+    if (config.FORBIDDEN_WORDS) {
+      logger.info('当前 FORBIDDEN_WORDS:', config.FORBIDDEN_WORDS)
+    }
+    if (config.BLOCKED_WORDS) {
+      logger.info('当前 BLOCKED_WORDS:', config.BLOCKED_WORDS)
+    }
   } catch (e) {
     logger.error('读取配置失败:', e.message)
     config = {}
@@ -673,22 +764,52 @@ async function writeConfig(db, newConfig) {
 
   // 先读取现有配置
   const existingConfig = await db.getConfig()
+  logger.info('现有配置:', JSON.stringify(existingConfig))
+  logger.info('新配置:', JSON.stringify(newConfig))
 
   // 合并配置，保留现有配置项
   const mergedConfig = {
     ...existingConfig,
     ...newConfig
   }
+  logger.info('合并后配置:', JSON.stringify(mergedConfig))
+
+  // 验证关键配置项
+  if (mergedConfig.AKISMET_KEY) {
+    logger.info('AKISMET_KEY 配置值为:', mergedConfig.AKISMET_KEY)
+  }
+  if (mergedConfig.LIMIT_LENGTH) {
+    logger.info('LIMIT_LENGTH 配置值为:', mergedConfig.LIMIT_LENGTH)
+  }
+  if (mergedConfig.FORBIDDEN_WORDS) {
+    logger.info('FORBIDDEN_WORDS 配置值为:', mergedConfig.FORBIDDEN_WORDS)
+  }
+  if (mergedConfig.BLOCKED_WORDS) {
+    logger.info('BLOCKED_WORDS 配置值为:', mergedConfig.BLOCKED_WORDS)
+  }
 
   await db.saveConfig(mergedConfig)
+
+  // 验证保存是否成功
+  const savedConfig = await db.getConfig()
+  logger.info('保存后从数据库读取的配置:', JSON.stringify(savedConfig))
+
   config = null
   return 1
 }
 
 async function isAdmin(accessToken, req) {
+  // 如果 accessToken 为空，直接返回 false
+  if (!accessToken) {
+    logger.info('isAdmin: accessToken 为空，返回 false')
+    return false
+  }
+
   // 如果全局配置存在且包含管理员密码，直接使用
   if (config && config.ADMIN_PASS) {
-    return config.ADMIN_PASS === md5(accessToken)
+    const isAdmin = config.ADMIN_PASS === md5(accessToken)
+    logger.info('isAdmin: 使用全局配置判断，accessToken:', accessToken.substring(0, 10) + '...', 'isAdmin:', isAdmin)
+    return isAdmin
   }
 
   // 否则从数据库读取配置
@@ -814,7 +935,10 @@ async function commentGet(event, db, accessToken, req) {
       }))
       : []
 
-    res.data = parseComment([...mainComments, ...replies], uid, config)
+    const allComments = [...mainComments, ...replies]
+    logger.info('commentGet - 评论数据（转换前）:', allComments.map(c => ({ id: c.id, isSpam: c.isSpam, nick: c.nick })))
+    res.data = parseComment(allComments, uid, config)
+    logger.info('commentGet - 评论数据（转换后）:', res.data.map(c => ({ id: c.id, isSpam: c.isSpam, nick: c.nick })))
     res.more = more
     res.count = count
   } catch (e) {
@@ -1027,7 +1151,10 @@ async function commentSubmit(event, req, db, accessToken) {
   // 垃圾检测
   const isSpam = await postCheckSpam(data, config)
   logger.log('垃圾检测结果：', isSpam)
-  if (isSpam) {
+
+  // 人工审核模式下，允许垃圾评论写入数据库（只有本人和管理员可见）
+  // 其他情况下，如果是垃圾评论则阻止提交
+  if (isSpam && config.AKISMET_KEY !== 'MANUAL_REVIEW') {
     throw new Error('评论被检测为垃圾评论，请修改后重新提交')
   }
 
@@ -1049,11 +1176,22 @@ async function parseCommentData(event, req, accessToken, ip) {
   const isAdminUser = await isAdmin(accessToken, req)
   const isBloggerMail = equalsMail(config.BLOGGER_EMAIL, event.mail)
 
+  logger.info('parseCommentData - isAdminUser:', isAdminUser, 'isBloggerMail:', isBloggerMail)
+
   if (isBloggerMail && !isAdminUser) {
     throw new Error('请先登录管理面板，再使用博主身份发送评论')
   }
 
   const hashMethod = config.GRAVATAR_CDN === 'cravatar.cn' ? md5 : sha256
+
+  // 记录 preCheckSpam 调用前的配置状态
+  logger.info('preCheckSpam 调用前配置:', {
+    AKISMET_KEY: config.AKISMET_KEY,
+    LIMIT_LENGTH: config.LIMIT_LENGTH,
+    FORBIDDEN_WORDS: config.FORBIDDEN_WORDS,
+    BLOCKED_WORDS: config.BLOCKED_WORDS,
+    isAdminUser: isAdminUser
+  })
 
   const commentDo = {
     id: uuidv4().replace(/-/g, ''),
@@ -1070,10 +1208,11 @@ async function parseCommentData(event, req, accessToken, ip) {
     comment: xss(event.comment),
     pid: event.pid ? event.pid : event.rid,
     rid: event.rid,
-    is_spam: isAdminUser ? false : preCheckSpam(event, config),
+    is_spam: isAdminUser ? false : preCheckSpamWithLog(event, config),
     created: timestamp,
     updated: timestamp
   }
+  logger.info('commentDo.is_spam:', commentDo.is_spam, 'isAdminUser:', isAdminUser)
 
   // 处理 QQ 邮箱和头像
   if (isQQ(event.mail)) {
