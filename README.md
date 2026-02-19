@@ -29,11 +29,7 @@
 
 查看 [腾讯云 EdgeOne Pages 文档](https://cloud.tencent.com/document/product/1552/127366) 了解更多详情。
 
-### 完整教程 | Full Tutorial
-
-Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs/twikoo 以及 Twikoo 的[快速上手](https://twikoo.js.org/quick-start.html)
-
-手动部署到 EdgeOne Pages 的方法如下： 
+### 完整教程
 
 #### 部署步骤 | Deployment Steps
 
@@ -120,27 +116,32 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
    CREATE INDEX idx_twikoo_is_spam ON twikoo(is_spam);
    ```
 
-   
-   
    - 为 `twikoo` 表添加行级安全策略
    
    ```sql
    -- ======================================
    -- 批次1：基础准备（清理旧策略+启用RLS）
    -- ======================================
-   -- 1. 启用RLS并强制所有者遵守（如果已启用可跳过，但执行也不影响）
+   -- 1. 启用RLS并强制所有者遵守
    ALTER TABLE public.twikoo ENABLE ROW LEVEL SECURITY;
    ALTER TABLE public.twikoo FORCE ROW LEVEL SECURITY;
    
-   -- 2. 删除原有冲突的SELECT策略（避免多策略叠加导致逻辑混乱）
+   -- 2. 删除所有旧策略（避免冲突）
    DROP POLICY IF EXISTS twikoo_admin_select_all ON public.twikoo;
    DROP POLICY IF EXISTS twikoo_public_select_non_spam ON public.twikoo;
    DROP POLICY IF EXISTS twikoo_own_select_non_spam ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_deny_delete_config ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_admin_all_write ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_own_update_non_spam ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_select_policy ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_admin_insert ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_admin_update ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_admin_delete ON public.twikoo;
    
    -- ======================================
    -- 批次2：创建核心辅助函数
    -- ======================================
-   -- 管理员判断函数（已存在则覆盖，保持最新）
+   -- 管理员判断函数（已存在则覆盖）
    CREATE OR REPLACE FUNCTION is_admin()
    RETURNS boolean AS $$
    BEGIN
@@ -157,9 +158,9 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
    $$ LANGUAGE plpgsql;
    
    -- ======================================
-   -- 批次3：创建所有RLS策略（核心）
+   -- 批次3：创建所有RLS策略（核心，修正INSERT语法）
    -- ======================================
-   -- 核心SELECT策略（合并所有查看规则：管理员看所有+普通用户看公开+自己的垃圾评论）
+   -- 核心SELECT策略（管理员看所有，普通用户看公开+自己的审核中的评论）
    CREATE POLICY twikoo_select_policy ON public.twikoo
        FOR SELECT
        USING (
@@ -168,30 +169,33 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
            OR (is_spam = true AND uid = current_user_uid())
        );
    
-   -- 禁止删除type=config的行
-   CREATE POLICY IF NOT EXISTS twikoo_deny_delete_config ON public.twikoo
+   -- 禁止删除type=config的行（DELETE用USING）
+   CREATE POLICY twikoo_deny_delete_config ON public.twikoo
        FOR DELETE
        USING (type <> 'config');
    
-   -- 管理员拥有所有写操作权限（INSERT/UPDATE/DELETE）
-   CREATE POLICY IF NOT EXISTS twikoo_admin_all_write ON public.twikoo
-       FOR INSERT, UPDATE, DELETE
+   -- 管理员INSERT策略（修正：INSERT用WITH CHECK）
+   CREATE POLICY twikoo_admin_insert ON public.twikoo
+       FOR INSERT
+       WITH CHECK (is_admin());
+   
+   -- 管理员UPDATE策略（UPDATE可同时用USING+WITH CHECK，这里简化为WITH CHECK）
+   CREATE POLICY twikoo_admin_update ON public.twikoo
+       FOR UPDATE
+       WITH CHECK (is_admin());
+   
+   -- 管理员DELETE策略（DELETE用USING）
+   CREATE POLICY twikoo_admin_delete ON public.twikoo
+       FOR DELETE
        USING (is_admin());
    
    -- ======================================
-   -- 批次4：赋予基础权限（策略生效的前提）
+   -- 批次4：赋予基础权限（替换为你的实际用户名）
    -- ======================================
-   -- 确保所有用户能看公开评论（public角色是所有用户的默认角色）
+   
+   -- 确保所有用户能看公开评论
    GRANT SELECT ON public.twikoo TO public;
    ```
-   
-   
-   
-   
-   
-   
-   
-   
    
 3. **创建 EdgeOne Pages 项目**
    - 登录腾讯云 EdgeOne 控制台
