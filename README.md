@@ -78,8 +78,11 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
    - **`type = 'config'`**：存储 Twikoo 管理后台的配置（如 SMTP、图床、反垃圾等设置），首次保存配置时自动创建
    - **`type = 'counter'`**：存储文章/页面访问计数
 
+   <br />
+
    - 使用以下 SQL 在 SQL Editor 中创建表：
    <img src="./docs/static/sql.png" width="300" alt="Twikoo">
+
    ```sql
    CREATE TABLE public.twikoo (
      id TEXT PRIMARY KEY,
