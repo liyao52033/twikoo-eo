@@ -795,13 +795,35 @@ function toCommentDto(comment, uid, replies = [], comments = [], cfg) {
 
 /**
  * 筛除隐私字段，拼接回复列表（本地实现，使用自己的 IP 归属地查询）
+ * @param {Array} comments - 评论列表
+ * @param {string} uid - 用户ID
+ * @param {Object} cfg - 配置
+ * @param {boolean} isAdmin - 是否是管理员
  */
-function parseComment(comments, uid, cfg) {
+function parseComment(comments, uid, cfg, isAdmin = false) {
   const result = []
   for (const comment of comments) {
     if (!comment.rid) {
+      // 检查主楼评论是否是审核中状态
+      const isMainSpam = !!(comment.isSpam !== undefined ? comment.isSpam : comment.is_spam)
+      // 如果是审核中的主楼评论，只有发布者本人以及管理员能看到
+      if (isMainSpam && !isAdmin) {
+        // 使用 uid 验证
+        if (!uid || comment.uid !== uid) continue
+      }
+
+      // 过滤回复：审核中的评论只有发布者本人以及管理员能看到
       const replies = comments
         .filter((item) => item.rid === comment.id.toString())
+        .filter((item) => {
+          // 如果不是审核中的评论，直接显示
+          const isSpam = !!(item.isSpam !== undefined ? item.isSpam : item.is_spam)
+          if (!isSpam) return true
+          // 管理员可以看到所有审核中的回复
+          if (isAdmin) return true
+          // 如果是审核中的评论，使用 uid 验证
+          return uid && item.uid === uid
+        })
         .map((item) => toCommentDto(item, uid, [], comments, cfg))
         .sort((a, b) => a.created - b.created)
       result.push(toCommentDto(comment, uid, replies, [], cfg))
@@ -892,16 +914,21 @@ function createSupabaseProxy(req) {
     }
 
     if (query.spamOnly) {
+      // 如果只查询审核中的评论
       builder = builder.eq('is_spam', true)
+      if (query.uidEq) {
+        builder = builder.eq('uid', query.uidEq)
+      }
     } else if (query.notSpamOnly) {
       // 只查询非垃圾评论 (is_spam is null or is_spam = false)
       builder = builder.or('is_spam.is.null,is_spam.eq.false')
     } else if (query.includeSpam === false) {
       // 普通用户：显示非垃圾评论，以及自己的垃圾评论
+      // 使用 uid 匹配
       if (query.uid) {
-        // 正确的逻辑：(is_spam is null OR is_spam = false) OR (is_spam = true AND uid = current_uid)
-        // Supabase 语法：or(is_spam.is.null,is_spam.eq.false,and(is_spam.eq.true,uid.eq.xxx))
-        builder = builder.or(`is_spam.is.null,is_spam.eq.false,and(is_spam.eq.true,uid.eq.${query.uid})`)
+        builder = builder.or(
+          `is_spam.is.null,is_spam.eq.false,and(is_spam.eq.true,uid.eq.${query.uid})`
+        )
       } else {
         builder = builder.or('is_spam.is.null,is_spam.eq.false')
       }
@@ -922,8 +949,243 @@ function createSupabaseProxy(req) {
     return builder
   }
 
+  // 分两次查询：非垃圾评论 + 自己的垃圾评论，然后合并
+  async function getCommentsWithSpam(query) {
+    logger.info('[Supabase] 使用合并查询方式获取评论')
+
+    // 查询1：获取所有非垃圾评论
+    const notSpamQuery = { ...query, notSpamOnly: true }
+    delete notSpamQuery.includeSpam
+    delete notSpamQuery.nick
+    delete notSpamQuery.mail
+
+    let builder1 = applyCommentFilters(
+      supabase.from('twikoo').select('*'),
+      notSpamQuery
+    )
+
+    if (query.orderByCreatedDesc) {
+      builder1 = builder1.order('created', { ascending: false })
+    }
+
+    if (query.range) {
+      builder1 = builder1.range(query.range.from, query.range.to)
+    } else if (query.limit) {
+      builder1 = builder1.limit(query.limit)
+    }
+
+    // 查询2：获取自己的垃圾评论（使用昵称和邮箱匹配）
+    const spamQuery = {
+      ...query,
+      spamOnly: true,
+      nick: query.nick,
+      mail: query.mail
+    }
+    delete spamQuery.includeSpam
+    delete spamQuery.notSpamOnly
+
+    let builder2 = applyCommentFilters(
+      supabase.from('twikoo').select('*'),
+      spamQuery
+    )
+
+    if (query.orderByCreatedDesc) {
+      builder2 = builder2.order('created', { ascending: false })
+    }
+
+    // 并行执行两个查询
+    const [{ data: notSpamData, error: error1 }, { data: spamData, error: error2 }] = await Promise.all([
+      builder1,
+      builder2
+    ])
+
+    if (error1) {
+      logger.error('[Supabase] 获取非垃圾评论失败:', error1.message)
+      throw error1
+    }
+    if (error2) {
+      logger.error('[Supabase] 获取垃圾评论失败:', error2.message)
+      throw error2
+    }
+
+    // 合并结果并去重
+    const notSpamComments = notSpamData || []
+    const spamComments = spamData || []
+    const allComments = [...notSpamComments]
+
+    // 只添加不在非垃圾评论列表中的垃圾评论
+    const existingIds = new Set(notSpamComments.map(c => c.id))
+    for (const spamComment of spamComments) {
+      if (!existingIds.has(spamComment.id)) {
+        allComments.push(spamComment)
+      }
+    }
+
+    // 按时间排序
+    if (query.orderByCreatedDesc) {
+      allComments.sort((a, b) => new Date(b.created) - new Date(a.created))
+    }
+
+    // 应用 limit
+    let resultComments = allComments
+    if (query.limit && resultComments.length > query.limit) {
+      resultComments = resultComments.slice(0, query.limit)
+    }
+
+    logger.info('[Supabase] getCommentsWithSpam 查询结果:', {
+      notSpamCount: notSpamComments.length,
+      spamCount: spamComments.length,
+      totalCount: resultComments.length
+    })
+
+    // 转换字段名以保持与原始代码兼容
+    return resultComments.map(item => ({
+      ...item,
+      mailMd5: item.mail_md5,
+      isSpam: item.is_spam === true,
+      like: item.likes
+    }))
+  }
+
+  // 使用 uid 从数据库查询用户的昵称和邮箱
+  async function getUserInfoByUid(uid) {
+    if (!uid) return null
+    try {
+      const { data, error } = await supabase
+        .from('twikoo')
+        .select('nick, mail')
+        .eq('type', 'comment')
+        .eq('uid', uid)
+        .order('created', { ascending: false })
+        .limit(1)
+
+      if (error) {
+        logger.warn('[Supabase] 查询用户信息失败:', error.message)
+        return null
+      }
+
+      // data 是数组，取第一个元素
+      if (data && data.length > 0) {
+        logger.info('[Supabase] 查询到用户信息:', { nick: data[0].nick, mail: data[0].mail })
+        return { nick: data[0].nick, mail: data[0].mail }
+      }
+      return null
+    } catch (e) {
+      logger.error('[Supabase] 获取用户信息异常:', e.message)
+      return null
+    }
+  }
+
+  // 使用 uid 查询自己的垃圾评论（兼容旧逻辑）
+  async function getCommentsWithSpamByUid(query) {
+    logger.info('[Supabase] 使用 uid 合并查询方式获取评论')
+
+    // 查询1：获取所有非垃圾评论
+    const notSpamQuery = { ...query, notSpamOnly: true }
+    delete notSpamQuery.includeSpam
+
+    let builder1 = applyCommentFilters(
+      supabase.from('twikoo').select('*'),
+      notSpamQuery
+    )
+
+    if (query.orderByCreatedDesc) {
+      builder1 = builder1.order('created', { ascending: false })
+    }
+
+    if (query.range) {
+      builder1 = builder1.range(query.range.from, query.range.to)
+    } else if (query.limit) {
+      builder1 = builder1.limit(query.limit)
+    }
+
+    // 查询2：获取自己的垃圾评论（使用 uid 匹配）
+    const spamQuery = {
+      ...query,
+      spamOnly: true,
+      uidEq: query.uid
+    }
+    delete spamQuery.includeSpam
+    delete spamQuery.notSpamOnly
+
+    let builder2 = applyCommentFilters(
+      supabase.from('twikoo').select('*'),
+      spamQuery
+    )
+
+    if (query.orderByCreatedDesc) {
+      builder2 = builder2.order('created', { ascending: false })
+    }
+
+    // 并行执行两个查询
+    const [{ data: notSpamData, error: error1 }, { data: spamData, error: error2 }] = await Promise.all([
+      builder1,
+      builder2
+    ])
+
+    if (error1) {
+      logger.error('[Supabase] 获取非垃圾评论失败:', error1.message)
+      throw error1
+    }
+    if (error2) {
+      logger.error('[Supabase] 获取垃圾评论失败:', error2.message)
+      throw error2
+    }
+
+    // 合并结果并去重
+    const notSpamComments = notSpamData || []
+    const spamComments = spamData || []
+    const allComments = [...notSpamComments]
+
+    // 只添加不在非垃圾评论列表中的垃圾评论
+    const existingIds = new Set(notSpamComments.map(c => c.id))
+    for (const spamComment of spamComments) {
+      if (!existingIds.has(spamComment.id)) {
+        allComments.push(spamComment)
+      }
+    }
+
+    // 按时间排序
+    if (query.orderByCreatedDesc) {
+      allComments.sort((a, b) => new Date(b.created) - new Date(a.created))
+    }
+
+    // 应用 limit
+    let resultComments = allComments
+    if (query.limit && resultComments.length > query.limit) {
+      resultComments = resultComments.slice(0, query.limit)
+    }
+
+    logger.info('[Supabase] getCommentsWithSpamByUid 查询结果:', {
+      notSpamCount: notSpamComments.length,
+      spamCount: spamComments.length,
+      totalCount: resultComments.length
+    })
+
+    // 转换字段名以保持与原始代码兼容
+    return resultComments.map(item => ({
+      ...item,
+      mailMd5: item.mail_md5,
+      isSpam: item.is_spam === true,
+      like: item.likes
+    }))
+  }
+
   return {
     async getComments(query = {}) {
+      logger.info('[Supabase] getComments 查询参数:', {
+        urlIn: query.urlIn,
+        includeSpam: query.includeSpam,
+        uid: query.uid,
+        ridIn: query.ridIn,
+        ridIsNullOrEmpty: query.ridIsNullOrEmpty
+      })
+
+      // 特殊处理：普通用户需要查询自己的审核中评论时，使用两次查询合并结果
+      if (query.includeSpam === false && !query.spamOnly && query.uid) {
+        return await getCommentsWithSpamByUid(query)
+      }
+
       let builder = applyCommentFilters(
         supabase.from('twikoo').select('*'),
         query
@@ -945,6 +1207,8 @@ function createSupabaseProxy(req) {
         logger.error('[Supabase] 获取评论失败:', error.message)
         throw error
       }
+
+      logger.info('[Supabase] getComments 查询结果数量:', data ? data.length : 0)
 
       // 转换字段名以保持与原始代码兼容
       logger.info('查询到的评论数据:', data.map(item => ({ id: item.id, is_spam: item.is_spam, is_spam_type: typeof item.is_spam, nick: item.nick })))
@@ -1202,6 +1466,34 @@ function createSupabaseProxy(req) {
 
         return data
       }
+    },
+    // 使用 uid 从数据库查询用户的昵称和邮箱
+    async getUserInfoByUid(uid) {
+      if (!uid) return null
+      try {
+        const { data, error } = await supabase
+          .from('twikoo')
+          .select('nick, mail')
+          .eq('type', 'comment')
+          .eq('uid', uid)
+          .order('created', { ascending: false })
+          .limit(1)
+
+        if (error) {
+          logger.warn('[Supabase] 查询用户信息失败:', error.message)
+          return null
+        }
+
+        // data 是数组，取第一个元素
+        if (data && data.length > 0) {
+          logger.info('[Supabase] 查询到用户信息:', { nick: data[0].nick, mail: data[0].mail })
+          return { nick: data[0].nick, mail: data[0].mail }
+        }
+        return null
+      } catch (e) {
+        logger.error('[Supabase] 获取用户信息异常:', e.message)
+        return null
+      }
     }
   }
 }
@@ -1212,7 +1504,6 @@ async function readConfig(req) {
   try {
     const db = createSupabaseProxy(req)
     config = await db.getConfig()
-    logger.info('读取配置成功:', JSON.stringify(config))
 
     // 验证关键配置项
     if (config.AKISMET_KEY) {
@@ -1366,6 +1657,7 @@ async function commentGet(event, db, accessToken, req) {
         ridIsNullOrEmpty: true,
         notSpamOnly: true
       })
+      // 使用 uid 来统计用户自己的审核中评论
       const countOwnSpam = await db.countComments({
         urlIn: urlQuery,
         ridIsNullOrEmpty: true,
@@ -1413,7 +1705,8 @@ async function commentGet(event, db, accessToken, req) {
 
     const allComments = [...mainComments, ...replies]
     logger.info('commentGet - 评论数据（转换前）:', allComments.map(c => ({ id: c.id, isSpam: c.isSpam, nick: c.nick })))
-    res.data = parseComment(allComments, uid, config)
+    // 使用 uid 来验证审核中评论的归属
+    res.data = parseComment(allComments, uid, config, isAdminUser)
     logger.info('commentGet - 评论数据（转换后）:', res.data.map(c => ({ id: c.id, isSpam: c.isSpam, nick: c.nick })))
     res.more = more
     res.count = count

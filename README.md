@@ -23,13 +23,11 @@
 
 ### 一键部署 | One-Click Deploy
 
-您可以通过 [腾讯云 EdgeOne Pages](https://pages.edgeone.ai/zh) 一键部署。
-
 直接点击此按钮一键部署：
 
-[![使用 EdgeOne Pages 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/pages/new?repository-url=https%3A%2F%2Fgithub.com%2FMintimate%2Ftwikoo-eo)
+[![使用 EdgeOne Pages 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/pages/new?repository-url=https://github.com/liyao52033/twikoo-eo/tree/supabase)
 
-查看 [腾讯云 EdgeOne Pages 文档](https://pages.edgeone.ai/zh/document/product-introduction) 了解更多详情。
+查看 [腾讯云 EdgeOne Pages 文档](https://cloud.tencent.com/document/product/1552/127366) 了解更多详情。
 
 ### 完整教程 | Full Tutorial
 
@@ -51,6 +49,7 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
    |--------|------|------|
    | `id` | text | 主键，记录唯一标识（Twikoo 生成的去掉横线的 UUID） |
    | `type` | text | 记录类型：`'comment'` 评论 / `'config'` 配置 / `'counter'` 计数器 |
+   | `uid` | text | 用户唯一标识（`md5(nick + mail)`，用于识别用户身份和审核中评论归属） |
    | `nick` | text | 评论者昵称（仅评论类型） |
    | `avatar` | text | 评论者头像 URL（仅评论类型） |
    | `mail` | text | 评论者邮箱（加密存储，仅评论类型） |
@@ -60,8 +59,10 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
    | `url` | text | 评论所在页面 URL / 计数器页面 URL |
    | `pid` | text | 父评论 ID（回复功能，仅评论类型） |
    | `rid` | text | 根评论 ID（楼中楼功能，仅评论类型） |
-   | `rids` | jsonb | 回复链 ID 列表（仅评论类型） |
+   | `ruser` | text | 被回复者昵称（回复功能，仅评论类型） |
+   | `href` | text | 评论页面完整 URL（仅评论类型） |
    | `master` | boolean | 是否为博主评论（仅评论类型） |
+   | `top` | boolean | 是否置顶（仅评论类型） |
    | `is_spam` | boolean | 是否为垃圾评论/待审核（仅评论类型） |
    | `likes` | jsonb | 点赞用户列表（仅评论类型） |
    | `ip` | text | 评论者 IP 地址（仅评论类型） |
@@ -71,18 +72,19 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
    | `count` | integer | 访问计数（仅计数器类型） |
    | `created` | timestamp | 记录创建时间 |
    | `updated` | timestamp | 记录更新时间 |
-   | `insertedAt` | timestamp | 数据插入时间 |
 
    **记录类型说明：**
    - **`type = 'comment'`**：存储用户评论数据
    - **`type = 'config'`**：存储 Twikoo 管理后台的配置（如 SMTP、图床、反垃圾等设置），首次保存配置时自动创建
    - **`type = 'counter'`**：存储文章/页面访问计数
 
-   - 使用以下 SQL 创建表：
+   - 使用以下 SQL 在 SQL Editor 中创建表：
+   <img src="./docs/static/sql.png" width="300" alt="Twikoo">
    ```sql
-   CREATE TABLE twikoo (
-     id TEXT PRIMARY KEY,  
+   CREATE TABLE public.twikoo (
+     id TEXT PRIMARY KEY,
      type TEXT NOT NULL DEFAULT 'comment',
+     uid TEXT,
      nick TEXT,
      avatar TEXT,
      mail TEXT,
@@ -92,8 +94,10 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
      url TEXT,
      pid TEXT,
      rid TEXT,
-     rids JSONB DEFAULT '[]',
+     ruser TEXT,
+     href TEXT,
      master BOOLEAN DEFAULT false,
+     top BOOLEAN DEFAULT false,
      is_spam BOOLEAN DEFAULT false,
      likes JSONB DEFAULT '[]',
      ip TEXT,
@@ -102,19 +106,90 @@ Twikoo 的完整教程，参考 Twikoo 官方项目: https://github.com/twikoojs
      title TEXT,
      count INTEGER DEFAULT 0,
      created TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-     updated TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-     "insertedAt" TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+     updated TIMESTAMP WITH TIME ZONE DEFAULT NOW()
    );
-
    -- 创建索引以提高查询性能
    CREATE INDEX idx_twikoo_url ON twikoo(url);
    CREATE INDEX idx_twikoo_rid ON twikoo(rid);
    CREATE INDEX idx_twikoo_pid ON twikoo(pid);
    CREATE INDEX idx_twikoo_type ON twikoo(type);
+   CREATE INDEX idx_twikoo_uid ON twikoo(uid);
    CREATE INDEX idx_twikoo_is_spam ON twikoo(is_spam);
-   CREATE INDEX idx_twikoo_created ON twikoo(created);
    ```
 
+   
+   
+   - 为 `twikoo` 表添加行级安全策略
+   
+   ```sql
+   -- ======================================
+   -- 批次1：基础准备（清理旧策略+启用RLS）
+   -- ======================================
+   -- 1. 启用RLS并强制所有者遵守（如果已启用可跳过，但执行也不影响）
+   ALTER TABLE public.twikoo ENABLE ROW LEVEL SECURITY;
+   ALTER TABLE public.twikoo FORCE ROW LEVEL SECURITY;
+   
+   -- 2. 删除原有冲突的SELECT策略（避免多策略叠加导致逻辑混乱）
+   DROP POLICY IF EXISTS twikoo_admin_select_all ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_public_select_non_spam ON public.twikoo;
+   DROP POLICY IF EXISTS twikoo_own_select_non_spam ON public.twikoo;
+   
+   -- ======================================
+   -- 批次2：创建核心辅助函数
+   -- ======================================
+   -- 管理员判断函数（已存在则覆盖，保持最新）
+   CREATE OR REPLACE FUNCTION is_admin()
+   RETURNS boolean AS $$
+   BEGIN
+       RETURN current_setting('app.is_admin', true)::boolean = true;
+   END;
+   $$ LANGUAGE plpgsql SECURITY DEFINER;
+   
+   -- 当前用户UID函数（已存在则覆盖）
+   CREATE OR REPLACE FUNCTION current_user_uid()
+   RETURNS text AS $$
+   BEGIN
+       RETURN current_setting('app.current_user_uid', true)::text;
+   END;
+   $$ LANGUAGE plpgsql;
+   
+   -- ======================================
+   -- 批次3：创建所有RLS策略（核心）
+   -- ======================================
+   -- 核心SELECT策略（合并所有查看规则：管理员看所有+普通用户看公开+自己的垃圾评论）
+   CREATE POLICY twikoo_select_policy ON public.twikoo
+       FOR SELECT
+       USING (
+           is_admin()
+           OR (is_spam = false)
+           OR (is_spam = true AND uid = current_user_uid())
+       );
+   
+   -- 禁止删除type=config的行
+   CREATE POLICY IF NOT EXISTS twikoo_deny_delete_config ON public.twikoo
+       FOR DELETE
+       USING (type <> 'config');
+   
+   -- 管理员拥有所有写操作权限（INSERT/UPDATE/DELETE）
+   CREATE POLICY IF NOT EXISTS twikoo_admin_all_write ON public.twikoo
+       FOR INSERT, UPDATE, DELETE
+       USING (is_admin());
+   
+   -- ======================================
+   -- 批次4：赋予基础权限（策略生效的前提）
+   -- ======================================
+   -- 确保所有用户能看公开评论（public角色是所有用户的默认角色）
+   GRANT SELECT ON public.twikoo TO public;
+   ```
+   
+   
+   
+   
+   
+   
+   
+   
+   
 3. **创建 EdgeOne Pages 项目**
    - 登录腾讯云 EdgeOne 控制台
    - 创建新的 Pages 项目
