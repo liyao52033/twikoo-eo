@@ -31,7 +31,6 @@ import {
   addQQMailSuffix,
   getQQAvatar,
   getPasswordStatus,
-  preCheckSpam,
   checkTurnstileCaptcha,
   getConfig,
   getConfigForAdmin,
@@ -57,8 +56,485 @@ async function postCheckSpam(comment, config) {
   }
   return originalPostCheckSpam(comment, config)
 }
-import { uploadImage } from 'twikoo-func/utils/image'
+
 import constants from 'twikoo-func/utils/constants'
+
+// ==================== 兼容 EdgeOne 环境的图片上传功能 ====================
+
+/**
+ * 将 base64 数据转换为 Blob 对象
+ */
+function base64ToBlob(base64Url, fileName) {
+  const base64 = base64Url.split(';base64,').pop()
+  const byteCharacters = atob(base64)
+  const byteNumbers = new Array(byteCharacters.length)
+  for (let i = 0; i < byteCharacters.length; i++) {
+    byteNumbers[i] = byteCharacters.charCodeAt(i)
+  }
+  const byteArray = new Uint8Array(byteNumbers)
+  return new Blob([byteArray])
+}
+
+/**
+ * 检查是否为有效的 URL
+ */
+function isUrl(string) {
+  try {
+    new URL(string)
+    return true
+  } catch (_) {
+    return false
+  }
+}
+
+/**
+ * 上传图片到 SM.MS 图床
+ */
+async function uploadImageToSmms(photo, fileName, config, imageCdn) {
+  const blob = base64ToBlob(photo, fileName)
+  const formData = new FormData()
+  formData.append('smfile', blob, fileName)
+
+  const response = await fetch(imageCdn, {
+    method: 'POST',
+    headers: {
+      'Authorization': config.IMAGE_CDN_TOKEN
+    },
+    body: formData
+  })
+
+  const result = await response.json()
+  if (result.success) {
+    return { data: result.data }
+  } else {
+    throw new Error(result.message || '上传失败')
+  }
+}
+
+/**
+ * 上传图片到兰空图床(Lsky Pro)
+ */
+async function uploadImageToLskyPro(photo, fileName, config, imageCdn) {
+  const blob = base64ToBlob(photo, fileName)
+  const formData = new FormData()
+  formData.append('file', blob, fileName)
+
+  if (process.env.TWIKOO_LSKY_STRATEGY_ID) {
+    formData.append('strategy_id', parseInt(process.env.TWIKOO_LSKY_STRATEGY_ID))
+  }
+
+  const url = `${imageCdn}/api/v1/upload`
+  let token = config.IMAGE_CDN_TOKEN
+  if (!token.startsWith('Bearer')) {
+    token = `Bearer ${token}`
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': token
+    },
+    body: formData
+  })
+
+  const result = await response.json()
+  if (result.status) {
+    return {
+      data: {
+        ...result.data,
+        url: result.data.links.url
+      }
+    }
+  } else {
+    throw new Error(result.message || '上传失败')
+  }
+}
+
+/**
+ * 上传图片到 PicList
+ * PicList 是一款图床管理软件，需要开启上传服务后使用
+ * 上传服务默认地址: http://localhost:36677
+ * 配置说明: https://piclist.cn/configure.html
+ */
+async function uploadImageToPicList(photo, fileName, config, imageCdn) {
+  const blob = base64ToBlob(photo, fileName)
+  const formData = new FormData()
+  formData.append('file', blob, fileName)
+
+  let url = `${imageCdn}/upload`
+  if (config.IMAGE_CDN_TOKEN) {
+    url += `?key=${config.IMAGE_CDN_TOKEN}`
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    body: formData
+  })
+
+  const result = await response.json()
+  if (result.success) {
+    return {
+      data: {
+        ...result,
+        url: result.result[0]
+      }
+    }
+  } else {
+    throw new Error(result.message || '上传失败')
+  }
+}
+
+/**
+ * 上传图片到 PicGo
+ * PicGo 是一款图床管理软件，需要开启「PicGo-Server」后使用
+ * 上传服务默认地址: http://localhost:36677
+ * 配置说明: https://picgo.github.io/PicGo-Doc/zh/guide/config.html#picgo-server
+ */
+async function uploadImageToPicGo(photo, fileName, config, imageCdn) {
+  const blob = base64ToBlob(photo, fileName)
+  const formData = new FormData()
+  formData.append('file', blob, fileName)
+
+  // PicGo API 不需要 key 参数，而是使用 list 参数来指定图床
+  const url = `${imageCdn}/upload`
+
+  const response = await fetch(url, {
+    method: 'POST',
+    body: formData
+  })
+
+  const result = await response.json()
+  // PicGo 返回格式: { success: true, result: ['url1', 'url2'] }
+  if (result.success && result.result && result.result.length > 0) {
+    return {
+      data: {
+        url: result.result[0],
+        fullResult: result
+      }
+    }
+  } else {
+    throw new Error(result.message || '上传失败')
+  }
+}
+
+/**
+ * 上传图片到 GitHub
+ * 配置要求:
+ * - IMAGE_CDN_URL: GitHub 仓库路径，格式: owner/repo/branch/path (如: username/images/main/img)
+ * - IMAGE_CDN_TOKEN: GitHub Personal Access Token (需要 repo 权限)
+ */
+async function uploadImageToGitHub(photo, fileName, config) {
+  if (!config.IMAGE_CDN_URL) {
+    throw new Error('未配置 GitHub 仓库路径 (IMAGE_CDN_URL)，格式: owner/repo/branch/path')
+  }
+  if (!config.IMAGE_CDN_TOKEN) {
+    throw new Error('未配置 GitHub Token (IMAGE_CDN_TOKEN)')
+  }
+
+  // 解析仓库路径: owner/repo/branch/path
+  const parts = config.IMAGE_CDN_URL.split('/')
+  if (parts.length < 3) {
+    throw new Error('GitHub 仓库路径格式错误，应为: owner/repo/branch/path')
+  }
+
+  const owner = parts[0]
+  const repo = parts[1]
+  const branch = parts[2]
+  const path = parts.slice(3).join('/') || ''
+
+  // 生成唯一文件名
+  const timestamp = Date.now()
+  const uniqueFileName = `${timestamp}_${fileName}`
+  const fullPath = path ? `${path}/${uniqueFileName}` : uniqueFileName
+
+  // 提取 base64 内容
+  const base64Content = photo.split(';base64,').pop()
+
+  // 调用 GitHub API 上传文件
+  const url = `https://api.github.com/repos/${owner}/${repo}/contents/${fullPath}`
+
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `token ${config.IMAGE_CDN_TOKEN}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'Twikoo'
+    },
+    body: JSON.stringify({
+      message: `Upload image via Twikoo: ${fileName}`,
+      content: base64Content,
+      branch: branch
+    })
+  })
+
+  const result = await response.json()
+
+  if (!response.ok) {
+    if (result.message && result.message.includes('already exists')) {
+      throw new Error('文件已存在，请重试')
+    }
+    throw new Error(`GitHub API 错误: ${result.message || response.statusText}`)
+  }
+
+  // 返回图片 URL (使用 jsDelivr CDN 加速)
+  const rawUrl = result.content.download_url
+  const cdnUrl = rawUrl.replace(
+    'https://raw.githubusercontent.com/',
+    'https://cdn.jsdelivr.net/gh/'
+  ).replace(`/${branch}/`, `@${branch}/`)
+
+  return {
+    data: {
+      url: cdnUrl,
+      raw_url: rawUrl,
+      html_url: result.content.html_url,
+      sha: result.content.sha
+    }
+  }
+}
+
+/**
+ * AWS Signature V4 签名辅助函数
+ */
+function getSignatureKey(key, dateStamp, regionName, serviceName) {
+  const kDate = hmacSHA256(`AWS4${key}`, dateStamp)
+  const kRegion = hmacSHA256(kDate, regionName)
+  const kService = hmacSHA256(kRegion, serviceName)
+  const kSigning = hmacSHA256(kService, 'aws4_request')
+  return kSigning
+}
+
+function hmacSHA256(key, data) {
+  const crypto = require('crypto')
+  return crypto.createHmac('sha256', key).update(data).digest()
+}
+
+function sha256Hash(data) {
+  const crypto = require('crypto')
+  return crypto.createHash('sha256').update(data).digest('hex')
+}
+
+function toHex(buffer) {
+  return buffer.toString('hex')
+}
+
+/**
+ * 上传图片到 S3 兼容存储 (hi168, AWS S3, 阿里云 OSS, 腾讯云 COS 等)
+ * 配置要求:
+ * - IMAGE_CDN_URL: 完整的 S3 URL，格式: https://endpoint/bucket/region/path
+ *   示例: https://s3.hi168.com/hi168-25202-9063qibb/us-east-1/picgo
+ * - IMAGE_CDN_TOKEN: 格式: accessKeyId:secretAccessKey
+ */
+async function uploadImageToS3(photo, fileName, config) {
+  if (!config.IMAGE_CDN_URL) {
+    throw new Error('未配置 S3 URL (IMAGE_CDN_URL)，格式: https://endpoint/bucket/region/path')
+  }
+  if (!config.IMAGE_CDN_TOKEN) {
+    throw new Error('未配置 S3 密钥 (IMAGE_CDN_TOKEN)，格式: accessKeyId:secretAccessKey')
+  }
+
+  // 解析密钥
+  const tokenParts = config.IMAGE_CDN_TOKEN.split(':')
+  if (tokenParts.length !== 2) {
+    throw new Error('S3 密钥格式错误，应为: accessKeyId:secretAccessKey')
+  }
+  const accessKeyId = tokenParts[0]
+  const secretAccessKey = tokenParts[1]
+
+  // 解析 URL: https://endpoint/bucket/region/path
+  const urlObj = new URL(config.IMAGE_CDN_URL)
+  const endpoint = `${urlObj.protocol}//${urlObj.host}`
+  const pathParts = urlObj.pathname.split('/').filter(p => p)
+
+  if (pathParts.length < 2) {
+    throw new Error('S3 URL 格式错误，应为: https://endpoint/bucket/region/path')
+  }
+
+  const bucket = pathParts[0]
+  const region = pathParts[1]
+  const pathPrefix = pathParts.slice(2).join('/')
+
+  // 生成唯一文件名
+  const timestamp = Date.now()
+  const uniqueFileName = `${timestamp}_${fileName}`
+  const objectKey = pathPrefix ? `${pathPrefix}/${uniqueFileName}` : uniqueFileName
+
+  // 提取二进制数据
+  const base64 = photo.split(';base64,').pop()
+  const binaryString = atob(base64)
+  const bytes = new Uint8Array(binaryString.length)
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i)
+  }
+
+  // 获取内容类型
+  const contentType = photo.match(/data:(.*?);base64/)?.[1] || 'image/jpeg'
+
+  // AWS Signature V4 签名
+  const now = new Date()
+  const dateStamp = now.toISOString().slice(0, 10).replace(/-/g, '')
+  const timeStamp = now.toISOString().replace(/[:-]/g, '').slice(0, 15) + 'Z'
+  const host = urlObj.host
+
+  // 计算 payload hash
+  const payloadHash = sha256Hash(Buffer.from(bytes))
+
+  // 构建规范请求
+  const canonicalUri = `/${bucket}/${objectKey}`
+  const canonicalQuerystring = ''
+  const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${timeStamp}\n`
+  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date'
+  const canonicalRequest = `PUT\n${canonicalUri}\n${canonicalQuerystring}\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`
+
+  // 构建待签名字符串
+  const algorithm = 'AWS4-HMAC-SHA256'
+  const credentialScope = `${dateStamp}/${region}/s3/aws4_request`
+  const stringToSign = `${algorithm}\n${timeStamp}\n${credentialScope}\n${sha256Hash(canonicalRequest)}`
+
+  // 计算签名
+  const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, 's3')
+  const signature = toHex(hmacSHA256(signingKey, stringToSign))
+
+  // 构建 Authorization header
+  const authorizationHeader = `${algorithm} Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+
+  // 发送 PUT 请求
+  const url = `${endpoint}/${bucket}/${objectKey}`
+
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Host': host,
+      'Content-Type': contentType,
+      'x-amz-date': timeStamp,
+      'x-amz-content-sha256': payloadHash,
+      'Authorization': authorizationHeader
+    },
+    body: bytes
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+    throw new Error(`S3 上传失败: ${response.status} ${response.statusText} - ${errorText}`)
+  }
+
+  // 构建访问 URL
+  const fileUrl = `${endpoint}/${bucket}/${objectKey}`
+
+  return {
+    data: {
+      url: fileUrl,
+      key: objectKey,
+      bucket: bucket
+    }
+  }
+}
+
+/**
+ * 上传图片到 EasyImage 2.0
+ */
+async function uploadImageToEasyImage(photo, fileName, config) {
+  if (!config.IMAGE_CDN_URL) {
+    throw new Error('未配置 EasyImage2.0 的 API 地址 (IMAGE_CDN_URL)')
+  }
+  if (!config.IMAGE_CDN_TOKEN) {
+    throw new Error('未配置 EasyImage2.0 的 Token (IMAGE_CDN_TOKEN)')
+  }
+
+  const blob = base64ToBlob(photo, fileName)
+  const formData = new FormData()
+  formData.append('token', config.IMAGE_CDN_TOKEN)
+  formData.append('image', blob, fileName)
+
+  const response = await fetch(config.IMAGE_CDN_URL, {
+    method: 'POST',
+    headers: {
+      'User-Agent': 'Twikoo'
+    },
+    body: formData
+  })
+
+  const result = await response.json()
+  if (result.code === 200 && result.result === 'success') {
+    return {
+      data: {
+        url: result.url,
+        thumb: result.thumb,
+        del: result.del
+      }
+    }
+  } else {
+    throw new Error(`API 返回错误 (CODE: ${result.code})`)
+  }
+}
+
+/**
+ * 主上传函数 - 兼容 EdgeOne 环境
+ */
+async function uploadImage(event, config) {
+  const { photo, fileName } = event
+  const res = {}
+
+  try {
+    if (!config.IMAGE_CDN) {
+      throw new Error('未配置图片上传服务 (IMAGE_CDN)')
+    }
+
+    // tip: qcloud 图床也支持后端上传
+    if (config.IMAGE_CDN === 'qcloud') {
+      // 腾讯云 COS - 使用 S3 兼容接口
+      if (!config.IMAGE_CDN_URL) {
+        throw new Error('未配置腾讯云 COS 信息 (IMAGE_CDN_URL)，格式: https://cos.region.myqcloud.com/bucket/region/path')
+      }
+      const result = await uploadImageToS3(photo, fileName, config)
+      res.data = result.data
+    } else if (config.IMAGE_CDN === '7bu') {
+      const result = await uploadImageToLskyPro(photo, fileName, config, 'https://7bu.top')
+      res.data = result.data
+    } else if (config.IMAGE_CDN === 'smms') {
+      const result = await uploadImageToSmms(photo, fileName, config, 'https://smms.app/api/v2/upload')
+      res.data = result.data
+    } else if (isUrl(config.IMAGE_CDN)) {
+      const result = await uploadImageToLskyPro(photo, fileName, config, config.IMAGE_CDN)
+      res.data = result.data
+    } else if (config.IMAGE_CDN === 'lskypro') {
+      if (!config.IMAGE_CDN_URL) {
+        throw new Error('未配置兰空图床 URL (IMAGE_CDN_URL)')
+      }
+      const result = await uploadImageToLskyPro(photo, fileName, config, config.IMAGE_CDN_URL)
+      res.data = result.data
+    } else if (config.IMAGE_CDN === 'piclist') {
+      if (!config.IMAGE_CDN_URL) {
+        throw new Error('未配置 PicList URL (IMAGE_CDN_URL)')
+      }
+      const result = await uploadImageToPicList(photo, fileName, config, config.IMAGE_CDN_URL)
+      res.data = result.data
+    } else if (config.IMAGE_CDN === 'picgo') {
+      if (!config.IMAGE_CDN_URL) {
+        throw new Error('未配置 PicGo URL (IMAGE_CDN_URL)')
+      }
+      const result = await uploadImageToPicGo(photo, fileName, config, config.IMAGE_CDN_URL)
+      res.data = result.data
+    } else if (config.IMAGE_CDN === 'github') {
+      const result = await uploadImageToGitHub(photo, fileName, config)
+      res.data = result.data
+    } else if (config.IMAGE_CDN === 's3') {
+      const result = await uploadImageToS3(photo, fileName, config)
+      res.data = result.data
+    } else if (config.IMAGE_CDN === 'easyimage') {
+      const result = await uploadImageToEasyImage(photo, fileName, config)
+      res.data = result.data
+    } else {
+      throw new Error(`不支持的图片上传服务: ${config.IMAGE_CDN}`)
+    }
+  } catch (e) {
+    logger.error('图片上传失败:', e)
+    res.code = RES_CODE.UPLOAD_FAILED
+    res.err = e.message
+  }
+
+  return res
+}
 
 const { RES_CODE } = constants
 const VERSION = '1.6.44'
