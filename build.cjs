@@ -1,6 +1,6 @@
 /**
  * Twikoo EdgeOne Pages 构建脚本
- * 
+ *
  * 处理不兼容包的覆写，类似 Cloudflare 版本的处理方式
  */
 
@@ -22,12 +22,12 @@ const ip2regionOutputPath = path.join(srcDir, 'node-functions/ip2region-data.js'
 if (fs.existsSync(ip2regionDbPath)) {
   const dbBuffer = fs.readFileSync(ip2regionDbPath)
   console.log(`  原始大小: ${(dbBuffer.length / 1024 / 1024).toFixed(2)} MB`)
-  
+
   const compressed = zlib.gzipSync(dbBuffer, { level: 9 })
   console.log(`  压缩后大小: ${(compressed.length / 1024 / 1024).toFixed(2)} MB`)
-  
+
   const base64 = compressed.toString('base64')
-  
+
   const jsContent = `/**
  * ip2region.db 数据（gzip 压缩 + Base64 编码）
  * 自动生成，请勿手动修改
@@ -56,12 +56,12 @@ export function getIp2RegionBuffer() {
 
 export default getIp2RegionBuffer
 `
-  
+
   fs.writeFileSync(ip2regionOutputPath, jsContent)
   console.log(`  ✓ 已生成: node-functions/ip2region-data.js (${(fs.statSync(ip2regionOutputPath).size / 1024 / 1024).toFixed(2)} MB)`)
 } else {
-  console.log(`  ✗ ip2region.db 不存在，跳过生成`)
-  console.log(`    请先运行: npm install @imaegoo/node-ip2region`)
+  console.log('  ✗ ip2region.db 不存在，跳过生成')
+  console.log('    请先运行: npm install @imaegoo/node-ip2region')
 }
 console.log('')
 
@@ -72,7 +72,7 @@ const packagesToOverwrite = [
   // tencentcloud-sdk 体积大且不兼容
   'node_modules/tencentcloud-sdk-nodejs/tencentcloud/index.js',
   // nodemailer 在某些环境下有兼容性问题
-  'node_modules/nodemailer/lib/nodemailer.js',
+  'node_modules/nodemailer/lib/nodemailer.js'
 ]
 
 console.log('步骤 1: 覆写不兼容的包...')

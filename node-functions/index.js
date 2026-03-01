@@ -17,15 +17,6 @@ import {
 } from 'twikoo-func/utils/lib'
 import { getIpRegion } from './ip2region-searcher.js'
 import {
-  logRequest,
-  logEvent,
-  logResponse,
-  logError,
-  logWarn,
-  logInfo,
-  logger
-} from './logger.js'
-import {
   getFuncVersion,
   getUrlQuery,
   getUrlsQuery,
@@ -54,10 +45,11 @@ import {
 import { postCheckSpam } from 'twikoo-func/utils/spam'
 import { sendNotice, emailTest } from 'twikoo-func/utils/notify'
 import { uploadImage } from 'twikoo-func/utils/image'
+import logger from 'twikoo-func/utils/logger'
 import constants from 'twikoo-func/utils/constants'
 
 const { RES_CODE, MAX_REQUEST_TIMES } = constants
-const VERSION = '1.6.45'
+const VERSION = '1.7.0'
 
 // 注入自定义依赖（对标 Cloudflare 版本）
 setCustomLibs({
@@ -420,6 +412,7 @@ async function commentGet (event, db, accessToken) {
     const uid = accessToken
     const isAdminUser = isAdmin(accessToken)
     const limit = parseInt(config.COMMENT_PAGE_SIZE) || 8
+    const sort = event.sort || 'newest'
     let more = false
 
     const urlQuery = getUrlQuery(event.url)
@@ -438,7 +431,18 @@ async function commentGet (event, db, accessToken) {
     const count = mainComments.length
 
     // 排序
-    mainComments.sort((a, b) => b.created - a.created)
+    if (sort === 'oldest') {
+      mainComments.sort((a, b) => a.created - b.created)
+    } else if (sort === 'popular') {
+      mainComments.sort((a, b) => {
+        const aUps = a.ups ? a.ups.length : 0
+        const bUps = b.ups ? b.ups.length : 0
+        if (bUps !== aUps) return bUps - aUps
+        return b.created - a.created
+      })
+    } else {
+      mainComments.sort((a, b) => b.created - a.created)
+    }
 
     // 处理置顶和分页
     let top = []
@@ -648,17 +652,35 @@ async function commentLike (event, db, accessToken) {
   const res = {}
   validate(event, ['id'])
   const uid = accessToken
+  const type = event.type || 'up'
   const comment = await db.getComment(event.id)
 
   if (comment) {
-    const likes = comment.like || []
-    const index = likes.indexOf(uid)
-    if (index === -1) {
-      likes.push(uid)
-    } else {
-      likes.splice(index, 1)
+    const ups = comment.ups || []
+    const downs = comment.downs || []
+
+    let newUps = [...ups]
+    let newDowns = [...downs]
+
+    if (type === 'up') {
+      const index = ups.indexOf(uid)
+      if (index === -1) {
+        newUps.push(uid)
+        newDowns = newDowns.filter((item) => item !== uid)
+      } else {
+        newUps.splice(index, 1)
+      }
+    } else if (type === 'down') {
+      const index = downs.indexOf(uid)
+      if (index === -1) {
+        newDowns.push(uid)
+        newUps = newUps.filter((item) => item !== uid)
+      } else {
+        newDowns.splice(index, 1)
+      }
     }
-    await db.updateComment(event.id, { like: likes })
+
+    await db.updateComment(event.id, { ups: newUps, downs: newDowns })
     res.updated = 1
   } else {
     res.updated = 0
@@ -960,7 +982,7 @@ export async function onRequest (context) {
       }
 
       // 手动处理路由
-      logRequest(method, url.pathname, url.search)
+      console.log(`[${new Date().toISOString()}] ${method} ${url.pathname}`)
 
       // CORS 处理
       const origin = headers.origin
@@ -1009,7 +1031,9 @@ async function handlePost (req, res) {
   const event = req.body || {}
   const ip = getIp(req)
 
-  logEvent(event.event, ip, event)
+  logger.log('请求 IP：', ip)
+  logger.log('请求函数：', event.event)
+  logger.log('请求参数：', event)
 
   let result = {}
 
@@ -1107,6 +1131,6 @@ async function handlePost (req, res) {
     result.message = e.message
   }
 
-  logResponse(event.event, result.code, result)
+  logger.log('请求返回：', result)
   res.json(result)
 }
