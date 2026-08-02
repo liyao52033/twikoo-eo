@@ -114,6 +114,20 @@
    CREATE INDEX idx_twikoo_type ON twikoo(type);
    CREATE INDEX idx_twikoo_uid ON twikoo(uid);
    CREATE INDEX idx_twikoo_is_spam ON twikoo(is_spam);
+
+   -- Cap 内嵌验证码所需的挑战和 token 存储表
+   CREATE TABLE public.cap_challenges (
+     token TEXT PRIMARY KEY,
+     challenge JSONB NOT NULL,
+     expires BIGINT NOT NULL
+   );
+   CREATE TABLE public.cap_tokens (
+     key TEXT PRIMARY KEY,
+     expires BIGINT NOT NULL
+   );
+   -- 启用 RLS：service role key 可绕过，前端无法直接访问
+   ALTER TABLE public.cap_challenges ENABLE ROW LEVEL SECURITY;
+   ALTER TABLE public.cap_tokens ENABLE ROW LEVEL SECURITY;
    ```
 
    - 为 `twikoo` 表添加行级安全策略
@@ -239,6 +253,42 @@
 
 ---
 
+## 人机验证 | CAPTCHA
+
+本版本参考上游 Twikoo 支持三种验证码提供商：Turnstile、Geetest 和 Cap。
+
+### Turnstile（Cloudflare）
+
+| 配置项 | 说明 |
+|--------|------|
+| `CAPTCHA_PROVIDER` | `Turnstile` |
+| `TURNSTILE_SITE_KEY` | 前端站点 key |
+| `TURNSTILE_SECRET_KEY` | 后端验证 key |
+
+### Geetest（极验）
+
+| 配置项 | 说明 |
+|--------|------|
+| `CAPTCHA_PROVIDER` | `Geetest` |
+| `GEETEST_CAPTCHA_ID` | 极验验证码 ID |
+| `GEETEST_CAPTCHA_KEY` | 极验验证码 key |
+
+### Cap.js
+
+Cap 是一款基于 SHA-256 PoW 的轻量开源验证码方案，支持**内嵌模式**和**外部 Standalone 模式**。
+
+| 配置项 | 说明 |
+|--------|------|
+| `CAPTCHA_PROVIDER` | `Cap` |
+| `CAP_API_ENDPOINT` | 外部 Standalone 实例地址，格式 `https://<实例地址>/<site_key>/`；留空则启用内嵌模式 |
+| `CAP_SECRET_KEY` | 外部 Standalone 模式需要；内嵌模式可留空 |
+
+**内嵌模式注意事项：**
+- 内嵌模式需要在 Supabase 中创建 `cap_challenges` 和 `cap_tokens` 表（见上方 SQL）
+- EdgeOne Pages 为 Serverless 架构，内嵌模式必须使用 Supabase 持久化存储挑战和 token，不能依赖内存
+
+---
+
 ## 自定义功能说明 | Custom Features
 
 本版本针对 EdgeOne Pages 平台进行了多项自定义实现，以下是各功能的详细说明及自定义原因。
@@ -283,15 +333,30 @@
 
 Token 获取: https://github.com/settings/tokens
 
-**2. S3 兼容存储 (hi168/AWS/阿里云 OSS/腾讯云 COS)**
+**2. S3 兼容存储 (AWS S3 / Cloudflare R2 / MinIO / 阿里云 OSS / 腾讯云 COS)**
+
+推荐新配置方式（与上游 Twikoo 一致）：
 
 | 配置项 | 值 |
 |--------|-----|
 | IMAGE_CDN | `s3` 或 `qcloud` |
+| S3_REGION | `us-east-1` 等 |
+| S3_BUCKET | `my-bucket` |
+| S3_ACCESS_KEY_ID | Access Key ID |
+| S3_SECRET_ACCESS_KEY | Secret Access Key |
+| S3_ENDPOINT | 可选，如 `https://s3.amazonaws.com`、`https://xxx.r2.cloudflarestorage.com`、`https://cos.ap-guangzhou.myqcloud.com` |
+| S3_PATH_PREFIX | 可选，对象 key 前缀 |
+| S3_FORCE_PATH_STYLE | 可选，`true`（默认）或 `false` |
+| S3_CDN_URL | 可选，访问 URL 自定义域名 |
+
+旧配置方式兼容（已弃用）：
+
+| 配置项 | 值 |
+|--------|-----|
 | IMAGE_CDN_URL | `https://端点/桶名/区域/路径`<br>如: `https://s3.hi168.com/mybucket/us-east-1/picgo` |
 | IMAGE_CDN_TOKEN | `AccessKeyId:SecretAccessKey` |
 
-URL 格式说明:
+URL 格式说明（旧方式）：
 ```
 https://s3.hi168.com/hi168-25202-9063qibb/us-east-1/picgo
 |------- 端点 -------|---- 桶名 ----|--区域--|--路径-|

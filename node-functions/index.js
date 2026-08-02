@@ -46,15 +46,175 @@ import {
 } from 'twikoo-func/utils/import'
 import { postCheckSpam as originalPostCheckSpam } from 'twikoo-func/utils/spam'
 import { sendNotice, emailTest } from 'twikoo-func/utils/notify'
+import { generateText } from '@xsai/generate-text'
+import Cap from '@cap.js/server'
 
-// 包装 postCheckSpam 函数，处理 MANUAL_REVIEW 模式
-async function postCheckSpam(comment, config) {
-  // 如果是人工审核模式，直接返回预检测的结果
-  if (config.AKISMET_KEY === 'MANUAL_REVIEW') {
-    logger.info('人工审核模式，跳过 postCheckSpam，使用预检测结果:', comment.is_spam)
-    return comment.is_spam
+// ==================== 垃圾评论检测（含 LLM 反垃圾） ====================
+
+// 提取 JSON 结构的函数
+function extractJson (rawText) {
+  if (!rawText) return ''
+  const trimmed = rawText.trim()
+  const match = trimmed.match(/\{[\s\S]*\}/)
+  return match ? match[0] : trimmed
+}
+
+// 移除 JSON 中多余的末尾逗号
+function repairJson (jsonStr) {
+  if (!jsonStr) return ''
+  let cleaned = jsonStr.trim()
+  cleaned = cleaned.replace(/,\s*([}\]])/g, '$1')
+  return cleaned
+}
+
+// 校验 LLM 返回的 JSON 是否包含 {"spam": boolean}
+function validateJson (jsonStr) {
+  try {
+    const obj = JSON.parse(jsonStr)
+    if (typeof obj !== 'object' || obj === null) {
+      return { valid: false, error: 'Parsed JSON is not an object' }
+    }
+    if (!('spam' in obj)) {
+      return { valid: false, error: 'Missing required key "spam"' }
+    }
+    if (typeof obj.spam !== 'boolean') {
+      return { valid: false, error: 'Key "spam" must be a boolean value' }
+    }
+    return { valid: true, data: obj }
+  } catch (err) {
+    return { valid: false, error: `JSON Parse failed: ${err.message}` }
   }
-  return originalPostCheckSpam(comment, config)
+}
+
+// 生成 LLM 提示词
+function buildMessages (commentData, errorMsg = '', customPrompt = '') {
+  const systemContent = customPrompt || `You are a blog comment moderation assistant. Analyze ALL fields below and determine if this submission is spam or ham.
+
+Spam includes ANY of the following in ANY field:
+- Commercial ads, promotions, or buying/selling offers (e.g., "代开发票", "加微信", "兼职", "办证", "AI中转站").
+- Special case: If the comment text is harmless, but the nickname is suspicious (e.g., contains ads or promotions) AND a website link is provided, treat it as SPAM.
+- Meaningless gibberish or spammy repetition (e.g., "顶顶顶", "111111", "asdfgh", "好" repeated).
+- Abusive language, insults, or offensive Chinese slang.
+- Suspicious links or SEO spam in the website field.
+- Bot-like automated greetings.
+
+Ham includes:
+- Genuine questions, constructive feedback, technical discussions, or normal greetings in Chinese/English.
+
+Strictly follow these rules:
+1. If ANY field contains spam content, output exactly {"spam": true}.
+2. If ALL fields are legitimate, output exactly {"spam": false}.
+3. Do not include any explanations, introduction, punctuation, or extra spaces. Output only the JSON object.
+
+Your response MUST be a single valid JSON object, like:
+{"spam": true} or {"spam": false}`
+
+  let userContent = `Comment: ${commentData.comment}
+Nickname: ${commentData.nick || ''}
+Website: ${commentData.link || ''}`
+
+  if (errorMsg) {
+    userContent += `\n\n[ERROR FROM PREVIOUS ATTEMPT]: Your last response failed verification with error: "${errorMsg}". Please correct your output format and make sure to return exactly valid JSON.`
+  }
+
+  const messages = [
+    { role: 'system', content: systemContent },
+    { role: 'user', content: userContent }
+  ]
+  logger.log('LLM 提示词：', messages)
+  return messages
+}
+
+// 兼容前端默认 endpoint（图片默认 https://api.deepseek.com，需补 /v1）
+function getLLMBaseURL (endpoint) {
+  if (!endpoint) return 'https://api.deepseek.com/v1'
+  const url = endpoint.replace(/\/$/, '')
+  if (url.includes('deepseek.com') && !url.match(/\/v\d+$/)) {
+    return url + '/v1'
+  }
+  return url
+}
+
+// LLM 反垃圾检测
+async function checkByLLM (comment, config) {
+  const maxRetries = Number(config.LLM_MAX_RETRIES) || 3
+  let lastError = ''
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    if (attempt > 1) {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+    try {
+      const messages = buildMessages(comment, lastError, config.LLM_SPAM_PROMPT)
+
+      const chatCompletion = await generateText({
+        apiKey: config.LLM_API_KEY,
+        baseURL: getLLMBaseURL(config.LLM_API_ENDPOINT),
+        model: config.LLM_MODEL || 'deepseek-v4-pro',
+        responseFormat: { type: 'json_object' },
+        messages
+      })
+
+      const rawText = chatCompletion.text || ''
+      const extracted = extractJson(rawText)
+      const repaired = repairJson(extracted)
+      const validation = validateJson(repaired)
+
+      if (validation.valid) {
+        const isSpam = validation.data.spam
+        if (isSpam) {
+          logger.info(`LLM 判定为 SPAM (尝试 ${attempt}/${maxRetries}): id="${comment.id}" nick="${comment.nick}"`)
+        } else {
+          logger.log(`LLM 判定为 HAM (尝试 ${attempt}/${maxRetries}): id="${comment.id}" nick="${comment.nick}"`)
+        }
+        return isSpam
+      } else {
+        lastError = validation.error
+        logger.warn(`LLM 返回校验失败 (尝试 ${attempt}/${maxRetries}), 错误: ${lastError}. 原始返回: "${rawText}"`)
+      }
+    } catch (error) {
+      lastError = error.message
+      logger.error(`LLM 请求异常 (尝试 ${attempt}/${maxRetries}), 错误: ${lastError}`)
+    }
+  }
+
+  logger.error(`LLM 垃圾评论检测历经 ${maxRetries} 次尝试均失败，执行兜底放行（返回 false）`)
+  return false
+}
+
+// 包装 postCheckSpam 函数，处理 MANUAL_REVIEW、Akismet 和 LLM 反垃圾
+async function postCheckSpam (comment, config) {
+  try {
+    // 预检测没过的，不再检测（兼容 isSpam / is_spam 两种字段名）
+    if (comment.isSpam || comment.is_spam) {
+      return true
+    }
+    // 博主本人评论，不检测
+    if (equalsMail(config.BLOGGER_EMAIL, comment.mail)) {
+      return false
+    }
+    // 人工审核模式
+    if (config.AKISMET_KEY === 'MANUAL_REVIEW') {
+      logger.info('人工审核模式，跳过 postCheckSpam，使用预检测结果:', comment.is_spam)
+      return comment.is_spam
+    }
+    // 腾讯云内容安全（当前版本未实现，避免调用被覆写的空模块）
+    if (config.QCLOUD_SECRET_ID && config.QCLOUD_SECRET_KEY) {
+      logger.warn('当前版本暂未实现腾讯云内容安全，请使用 Akismet 或 LLM 反垃圾')
+    }
+    // Akismet
+    if (config.AKISMET_KEY) {
+      return await originalPostCheckSpam(comment, config)
+    }
+    // LLM 反垃圾
+    if (config.LLM_API_KEY) {
+      return await checkByLLM(comment, config)
+    }
+    return false
+  } catch (err) {
+    logger.error('postCheckSpam 异常：', err)
+    return false
+  }
 }
 
 import constants from 'twikoo-func/utils/constants'
@@ -319,96 +479,134 @@ function toHex(buffer) {
 }
 
 /**
- * 上传图片到 S3 兼容存储 (hi168, AWS S3, 阿里云 OSS, 腾讯云 COS 等)
- * 配置要求:
- * - IMAGE_CDN_URL: 完整的 S3 URL，格式: https://endpoint/bucket/region/path
- *   示例: https://s3.hi168.com/hi168-25202-9063qibb/us-east-1/picgo
- * - IMAGE_CDN_TOKEN: 格式: accessKeyId:secretAccessKey
+ * 上传图片到 S3 兼容存储 (AWS S3, Cloudflare R2, MinIO, 腾讯云 COS, 阿里云 OSS 等)
+ *
+ * 新配置方式（与上游一致）：
+ * - S3_BUCKET
+ * - S3_ACCESS_KEY_ID
+ * - S3_SECRET_ACCESS_KEY
+ * - S3_REGION（默认 us-east-1）
+ * - S3_ENDPOINT（可选，如 https://s3.amazonaws.com、https://xxx.r2.cloudflarestorage.com）
+ * - S3_PATH_PREFIX（可选）
+ * - S3_FORCE_PATH_STYLE（默认 true）
+ * - S3_CDN_URL（可选，访问 URL 自定义域名）
+ *
+ * 旧配置方式兼容（已弃用）：
+ * - IMAGE_CDN_URL: https://endpoint/bucket/region/path
+ * - IMAGE_CDN_TOKEN: accessKeyId:secretAccessKey
  */
 async function uploadImageToS3(photo, fileName, config) {
-  if (!config.IMAGE_CDN_URL) {
-    throw new Error('未配置 S3 URL (IMAGE_CDN_URL)，格式: https://endpoint/bucket/region/path')
+  // 1. 解析参数（新配置优先，旧配置兼容）
+  let bucket, region, accessKeyId, secretAccessKey, endpointBase, pathPrefix, forcePathStyle, cdnUrl
+
+  if (config.S3_BUCKET && config.S3_ACCESS_KEY_ID && config.S3_SECRET_ACCESS_KEY) {
+    // 新配置方式
+    bucket = config.S3_BUCKET
+    region = config.S3_REGION || 'us-east-1'
+    accessKeyId = config.S3_ACCESS_KEY_ID
+    secretAccessKey = config.S3_SECRET_ACCESS_KEY
+    endpointBase = config.S3_ENDPOINT ? config.S3_ENDPOINT.replace(/\/$/, '') : null
+    pathPrefix = config.S3_PATH_PREFIX ? config.S3_PATH_PREFIX.replace(/\/$/, '') + '/' : ''
+    forcePathStyle = String(config.S3_FORCE_PATH_STYLE).trim().toLowerCase() !== 'false'
+    cdnUrl = config.S3_CDN_URL
+  } else if (config.IMAGE_CDN_URL && config.IMAGE_CDN_TOKEN) {
+    // 旧配置方式兼容：IMAGE_CDN_URL=https://endpoint/bucket/region/path
+    const tokenParts = config.IMAGE_CDN_TOKEN.split(':')
+    if (tokenParts.length !== 2) {
+      throw new Error('S3 密钥格式错误，应为: accessKeyId:secretAccessKey')
+    }
+    accessKeyId = tokenParts[0]
+    secretAccessKey = tokenParts[1]
+
+    const urlObj = new URL(config.IMAGE_CDN_URL)
+    endpointBase = `${urlObj.protocol}//${urlObj.host}`
+    const pathParts = urlObj.pathname.split('/').filter(p => p)
+    if (pathParts.length < 2) {
+      throw new Error('S3 URL 格式错误，应为: https://endpoint/bucket/region/path')
+    }
+    bucket = pathParts[0]
+    region = pathParts[1]
+    const oldPrefix = pathParts.slice(2).join('/')
+    pathPrefix = oldPrefix ? oldPrefix + '/' : ''
+    forcePathStyle = true
+  } else {
+    throw new Error('未配置 S3 图床参数。请配置 S3_BUCKET、S3_ACCESS_KEY_ID、S3_SECRET_ACCESS_KEY，或旧的 IMAGE_CDN_URL + IMAGE_CDN_TOKEN')
   }
-  if (!config.IMAGE_CDN_TOKEN) {
-    throw new Error('未配置 S3 密钥 (IMAGE_CDN_TOKEN)，格式: accessKeyId:secretAccessKey')
-  }
 
-  // 解析密钥
-  const tokenParts = config.IMAGE_CDN_TOKEN.split(':')
-  if (tokenParts.length !== 2) {
-    throw new Error('S3 密钥格式错误，应为: accessKeyId:secretAccessKey')
-  }
-  const accessKeyId = tokenParts[0]
-  const secretAccessKey = tokenParts[1]
-
-  // 解析 URL: https://endpoint/bucket/region/path
-  const urlObj = new URL(config.IMAGE_CDN_URL)
-  const endpoint = `${urlObj.protocol}//${urlObj.host}`
-  const pathParts = urlObj.pathname.split('/').filter(p => p)
-
-  if (pathParts.length < 2) {
-    throw new Error('S3 URL 格式错误，应为: https://endpoint/bucket/region/path')
-  }
-
-  const bucket = pathParts[0]
-  const region = pathParts[1]
-  const pathPrefix = pathParts.slice(2).join('/')
-
-  // 生成唯一文件名
+  // 2. 生成对象 key
   const timestamp = Date.now()
   const uniqueFileName = `${timestamp}_${fileName}`
-  const objectKey = pathPrefix ? `${pathPrefix}/${uniqueFileName}` : uniqueFileName
+  const key = `${pathPrefix}${uniqueFileName}`
 
-  // 提取二进制数据
+  // 3. 构建 endpoint
+  let s3Base, endpoint
+  if (endpointBase) {
+    // 自定义 S3 Endpoint（R2 / MinIO / COS / OSS 等）
+    s3Base = forcePathStyle ? `${endpointBase}/${bucket}` : endpointBase
+    endpoint = `${s3Base}/${key}`
+  } else {
+    // 标准 AWS S3 virtual-hosted-style
+    s3Base = `https://${bucket}.s3.${region}.amazonaws.com`
+    endpoint = `${s3Base}/${key}`
+  }
+
+  const urlObj = new URL(endpoint)
+  const host = urlObj.host
+  const pathname = urlObj.pathname
+
+  // 4. 提取图片二进制
   const base64 = photo.split(';base64,').pop()
   const binaryString = atob(base64)
   const bytes = new Uint8Array(binaryString.length)
   for (let i = 0; i < binaryString.length; i++) {
     bytes[i] = binaryString.charCodeAt(i)
   }
-
-  // 获取内容类型
   const contentType = photo.match(/data:(.*?);base64/)?.[1] || 'image/jpeg'
 
-  // AWS Signature V4 签名
+  // 5. AWS Signature V4
   const now = new Date()
   const dateStamp = now.toISOString().slice(0, 10).replace(/-/g, '')
   const timeStamp = now.toISOString().replace(/[:-]/g, '').slice(0, 15) + 'Z'
-  const host = urlObj.host
-
-  // 计算 payload hash
   const payloadHash = sha256Hash(Buffer.from(bytes))
 
-  // 构建规范请求
-  const canonicalUri = `/${bucket}/${objectKey}`
-  const canonicalQuerystring = ''
-  const canonicalHeaders = `host:${host}\nx-amz-content-sha256:${payloadHash}\nx-amz-date:${timeStamp}\n`
-  const signedHeaders = 'host;x-amz-content-sha256;x-amz-date'
-  const canonicalRequest = `PUT\n${canonicalUri}\n${canonicalQuerystring}\n${canonicalHeaders}\n${signedHeaders}\n${payloadHash}`
+  const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date'
+  const canonicalHeaders = [
+    `content-type:${contentType}`,
+    `host:${host}`,
+    `x-amz-content-sha256:${payloadHash}`,
+    `x-amz-date:${timeStamp}`
+  ].join('\n') + '\n'
 
-  // 构建待签名字符串
-  const algorithm = 'AWS4-HMAC-SHA256'
+  const canonicalRequest = [
+    'PUT',
+    pathname,
+    '',
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash
+  ].join('\n')
+
   const credentialScope = `${dateStamp}/${region}/s3/aws4_request`
-  const stringToSign = `${algorithm}\n${timeStamp}\n${credentialScope}\n${sha256Hash(canonicalRequest)}`
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    timeStamp,
+    credentialScope,
+    sha256Hash(canonicalRequest)
+  ].join('\n')
 
-  // 计算签名
   const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, 's3')
   const signature = toHex(hmacSHA256(signingKey, stringToSign))
+  const authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
 
-  // 构建 Authorization header
-  const authorizationHeader = `${algorithm} Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
-
-  // 发送 PUT 请求
-  const url = `${endpoint}/${bucket}/${objectKey}`
-
-  const response = await fetch(url, {
+  // 6. 发送 PUT 请求
+  const response = await fetch(endpoint, {
     method: 'PUT',
     headers: {
       'Host': host,
       'Content-Type': contentType,
       'x-amz-date': timeStamp,
       'x-amz-content-sha256': payloadHash,
-      'Authorization': authorizationHeader
+      'Authorization': authorization
     },
     body: bytes
   })
@@ -418,14 +616,19 @@ async function uploadImageToS3(photo, fileName, config) {
     throw new Error(`S3 上传失败: ${response.status} ${response.statusText} - ${errorText}`)
   }
 
-  // 构建访问 URL
-  const fileUrl = `${endpoint}/${bucket}/${objectKey}`
+  // 7. 构建访问 URL
+  let fileUrl
+  if (cdnUrl) {
+    fileUrl = `${cdnUrl.replace(/\/$/, '')}/${key}`
+  } else {
+    fileUrl = `${s3Base}/${key}`
+  }
 
   return {
     data: {
       url: fileUrl,
-      key: objectKey,
-      bucket: bucket
+      key,
+      bucket
     }
   }
 }
@@ -483,8 +686,8 @@ async function uploadImage(event, config) {
     // tip: qcloud 图床也支持后端上传
     if (config.IMAGE_CDN === 'qcloud') {
       // 腾讯云 COS - 使用 S3 兼容接口
-      if (!config.IMAGE_CDN_URL) {
-        throw new Error('未配置腾讯云 COS 信息 (IMAGE_CDN_URL)，格式: https://cos.region.myqcloud.com/bucket/region/path')
+      if (!config.IMAGE_CDN_URL && (!config.S3_BUCKET || !config.S3_ACCESS_KEY_ID || !config.S3_SECRET_ACCESS_KEY)) {
+        throw new Error('未配置腾讯云 COS 信息')
       }
       const result = await uploadImageToS3(photo, fileName, config)
       res.data = result.data
@@ -519,6 +722,10 @@ async function uploadImage(event, config) {
       const result = await uploadImageToGitHub(photo, fileName, config)
       res.data = result.data
     } else if (config.IMAGE_CDN === 's3') {
+      if ((!config.S3_BUCKET || !config.S3_ACCESS_KEY_ID || !config.S3_SECRET_ACCESS_KEY) &&
+          (!config.IMAGE_CDN_URL || !config.IMAGE_CDN_TOKEN)) {
+        throw new Error('未配置 S3 图床参数。请配置 S3_BUCKET、S3_ACCESS_KEY_ID、S3_SECRET_ACCESS_KEY，或旧的 IMAGE_CDN_URL + IMAGE_CDN_TOKEN')
+      }
       const result = await uploadImageToS3(photo, fileName, config)
       res.data = result.data
     } else if (config.IMAGE_CDN === 'easyimage') {
@@ -2050,12 +2257,157 @@ async function limitFilter(db, ip) {
   }
 }
 
+// ==================== 人机验证（Cap.js） ====================
+
+// Cap 内嵌模式的挑战参数
+const CAP_CHALLENGE_OPTS = {
+  challengeCount: 50,
+  challengeSize: 32,
+  challengeDifficulty: 4,
+  expiresMs: 600000 // 10 min
+}
+
+// 基于 Supabase 的 Cap 存储适配器（用于内嵌模式跨实例共享状态）
+function createCapStorage(supabaseClient) {
+  return {
+    challenges: {
+      store: async (token, data) => {
+        const { error } = await supabaseClient.from('cap_challenges').upsert({
+          token,
+          challenge: data.challenge,
+          expires: data.expires
+        }, { onConflict: 'token' })
+        if (error) logger.error('Cap challenge store error:', error.message)
+      },
+      read: async (token) => {
+        const { data, error } = await supabaseClient
+          .from('cap_challenges')
+          .select('challenge, expires')
+          .eq('token', token)
+          .gt('expires', Date.now())
+          .single()
+        if (error || !data) return null
+        return { challenge: data.challenge, expires: data.expires }
+      },
+      delete: async (token) => {
+        await supabaseClient.from('cap_challenges').delete().eq('token', token)
+      },
+      deleteExpired: async () => {
+        await supabaseClient.from('cap_challenges').delete().lte('expires', Date.now())
+      }
+    },
+    tokens: {
+      store: async (key, expires) => {
+        const { error } = await supabaseClient.from('cap_tokens').upsert({
+          key,
+          expires
+        }, { onConflict: 'key' })
+        if (error) logger.error('Cap token store error:', error.message)
+      },
+      get: async (key) => {
+        const { data, error } = await supabaseClient
+          .from('cap_tokens')
+          .select('expires')
+          .eq('key', key)
+          .gt('expires', Date.now())
+          .single()
+        if (error || !data) return null
+        return data.expires
+      },
+      delete: async (key) => {
+        await supabaseClient.from('cap_tokens').delete().eq('key', key)
+      },
+      deleteExpired: async () => {
+        await supabaseClient.from('cap_tokens').delete().lte('expires', Date.now())
+      }
+    }
+  }
+}
+
+// 创建 Cap 实例（内嵌模式使用 Supabase 存储）
+function createCap(config) {
+  const isBuiltin = config && config.CAPTCHA_PROVIDER === 'Cap' && !config.CAP_API_ENDPOINT
+  if (!isBuiltin) return null
+  return new Cap({
+    noFSState: true,
+    storage: createCapStorage(supabase)
+  })
+}
+
+// 校验 Cap 验证码（支持内嵌模式和外部 Standalone 模式）
+async function checkCapCaptcha({ capToken, capSecretKey, capApiEndpoint, cap }) {
+  try {
+    // 内嵌模式：直接 validateToken
+    if (cap) {
+      if (!capToken) throw new Error('Cap 验证码 token 不能为空')
+      const { success } = await cap.validateToken(capToken)
+      if (!success) throw new Error('Cap 验证码错误')
+      return
+    }
+    // 外部 Cap Standalone：HTTP siteverify
+    if (!capToken) throw new Error('Cap 验证码 token 不能为空')
+    const endpoint = capApiEndpoint.replace(/\/$/, '')
+    const url = `${endpoint}/siteverify`
+    logger.log('Cap 验证码验证 URL:', url)
+    logger.log('Cap 验证码验证参数:', { secret: capSecretKey ? '***' : undefined, response: capToken.substring(0, 20) + '...' })
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: capSecretKey, response: capToken })
+    })
+    const data = await response.json()
+    logger.log('Cap 验证码检测结果:', data)
+    if (!data.success) throw new Error(data.error || 'Cap 验证码错误')
+  } catch (e) {
+    throw new Error('Cap 验证码检测失败: ' + e.message)
+  }
+}
+
+// 生成内嵌 Cap 挑战
+async function capChallenge() {
+  if (config.CAPTCHA_PROVIDER !== 'Cap' || config.CAP_API_ENDPOINT) {
+    return { code: RES_CODE.FAIL, message: '内嵌 Cap 未启用' }
+  }
+  const cap = createCap(config)
+  const data = await cap.createChallenge(CAP_CHALLENGE_OPTS)
+  return { code: RES_CODE.SUCCESS, data }
+}
+
+// 兑换内嵌 Cap 挑战
+async function capRedeem(event) {
+  if (config.CAPTCHA_PROVIDER !== 'Cap' || config.CAP_API_ENDPOINT) {
+    return { code: RES_CODE.FAIL, message: '内嵌 Cap 未启用' }
+  }
+  const token = event && event.token
+  const solutions = event && event.solutions
+  if (!token || !solutions || !Array.isArray(solutions)) {
+    return { code: RES_CODE.FAIL, message: '缺少 token 或 solutions' }
+  }
+  const cap = createCap(config)
+  const data = await cap.redeemChallenge({ token, solutions })
+  return { code: RES_CODE.SUCCESS, data }
+}
+
 async function checkCaptcha(event, ip) {
-  if (config.TURNSTILE_SITE_KEY && config.TURNSTILE_SECRET_KEY) {
+  const provider = config.CAPTCHA_PROVIDER
+  if (provider === 'Turnstile' && config.TURNSTILE_SITE_KEY && config.TURNSTILE_SECRET_KEY) {
     await checkTurnstileCaptcha({
       ip: ip,
       turnstileToken: event.turnstileToken,
       turnstileTokenSecretKey: config.TURNSTILE_SECRET_KEY
+    })
+  } else if (provider === 'Cap' && config.CAP_API_ENDPOINT && config.CAP_SECRET_KEY) {
+    // 外部 Cap Standalone 模式
+    await checkCapCaptcha({
+      capToken: event.capToken,
+      capSecretKey: config.CAP_SECRET_KEY,
+      capApiEndpoint: config.CAP_API_ENDPOINT
+    })
+  } else if (provider === 'Cap' && !config.CAP_API_ENDPOINT) {
+    // 内嵌 Cap 模式
+    await checkCapCaptcha({
+      capToken: event.capToken,
+      cap: createCap(config)
     })
   }
 }
@@ -2307,6 +2659,12 @@ async function handlePost(req, res) {
       case 'COMMENT_LIKE':
         result = await commentLike(event, db, accessToken)
         break
+      case 'CAP_CHALLENGE':
+        result = await capChallenge()
+        break
+      case 'CAP_REDEEM':
+        result = await capRedeem(event)
+        break
       case 'COMMENT_SUBMIT':
         result = await commentSubmit(event, req, db, accessToken)
         break
@@ -2319,10 +2677,26 @@ async function handlePost(req, res) {
       case 'SET_PASSWORD':
         result = await setPassword(event, db, accessToken, req)
         break
-      case 'GET_CONFIG':
+      case 'GET_CONFIG': {
         const isAdminForConfig = await isAdmin(accessToken, req)
         result = await getConfig({ config, VERSION, isAdmin: isAdminForConfig })
+        // 补充验证码相关字段（twikoo-func 1.7.15 的 getConfig 未包含 upstream 新增字段）
+        if (config.CAPTCHA_PROVIDER) {
+          result.config.CAPTCHA_PROVIDER = config.CAPTCHA_PROVIDER
+          if (config.CAPTCHA_PROVIDER === 'Turnstile') {
+            result.config.TURNSTILE_SITE_KEY = config.TURNSTILE_SITE_KEY
+          } else if (config.CAPTCHA_PROVIDER === 'Geetest') {
+            result.config.GEETEST_CAPTCHA_ID = config.GEETEST_CAPTCHA_ID
+          } else if (config.CAPTCHA_PROVIDER === 'Cap') {
+            if (config.CAP_API_ENDPOINT) {
+              result.config.CAP_API_ENDPOINT = config.CAP_API_ENDPOINT
+            } else {
+              result.config.CAP_BUILTIN = true
+            }
+          }
+        }
         break
+      }
       case 'GET_CONFIG_FOR_ADMIN':
         const isAdminForConfigAdmin = await isAdmin(accessToken, req)
         result = await getConfigForAdmin({ config, isAdmin: isAdminForConfigAdmin })
