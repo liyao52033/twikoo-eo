@@ -2273,7 +2273,7 @@ function createCapStorage(supabaseClient) {
       store: async (token, data) => {
         const { error } = await supabaseClient.from('cap_challenges').upsert({
           token,
-          challenge: JSON.stringify(data.challenge),
+          challenge: data.challenge,
           expires: data.expires
         }, { onConflict: 'token' })
         if (error) logger.error('Cap challenge store error:', error.message)
@@ -2287,6 +2287,7 @@ function createCapStorage(supabaseClient) {
           .single()
         if (error || !data) return null
         let challenge = data.challenge
+        // 兼容：如果 challenge 被序列化为字符串则解析
         if (typeof challenge === 'string') {
           try { challenge = JSON.parse(challenge) } catch (e) { return null }
         }
@@ -2331,7 +2332,7 @@ function createCapStorage(supabaseClient) {
 // 生成内嵌 Cap 挑战（直接使用 Supabase，绕过 Cap 内存状态）
 async function capChallenge() {
   if (config.CAPTCHA_PROVIDER !== 'Cap' || config.CAP_API_ENDPOINT) {
-    return { code: RES_CODE.FAIL, message: '内嵌 Cap 未启用' }
+    throw new Error('内嵌 Cap 未启用')
   }
   const storage = createCapStorage(supabase)
   const crypto = require('crypto')
@@ -2347,7 +2348,8 @@ async function capChallenge() {
   const token = crypto.randomBytes(25).toString('hex')
   const expires = Date.now() + CAP_CHALLENGE_OPTS.expiresMs
   await storage.challenges.store(token, { challenge: challenges, expires })
-  return { code: RES_CODE.SUCCESS, data: { challenge: challenges, token, expires } }
+  // 返回前端 Cap.js 客户端期望的扁平格式
+  return { challenge: challenges, token, expires }
 }
 
 // 兑换内嵌 Cap 挑战（直接使用 Supabase）
