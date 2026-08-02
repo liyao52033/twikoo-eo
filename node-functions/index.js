@@ -537,7 +537,7 @@ async function uploadImage(event, config) {
 }
 
 const { RES_CODE } = constants
-const VERSION = '1.6.44'
+const VERSION = '1.7.15'
 
 // 自定义 preCheckSpam 函数，确保人工审核模式正确工作
 function preCheckSpamWithLog(event, config) {

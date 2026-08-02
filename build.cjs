@@ -34,7 +34,7 @@ if (fs.existsSync(ip2regionDbPath)) {
  * 原始大小: ${(dbBuffer.length / 1024 / 1024).toFixed(2)} MB
  * 压缩后: ${(compressed.length / 1024 / 1024).toFixed(2)} MB
  */
-import pako from 'pako'
+import * as pako from 'pako'
 
 const IP2REGION_DATA_BASE64 = '${base64}'
 
