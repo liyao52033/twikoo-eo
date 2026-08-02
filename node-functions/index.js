@@ -2286,12 +2286,16 @@ function createCapStorage(supabaseClient) {
           .gt('expires', Date.now())
           .single()
         if (error || !data) return null
+        logger.log('Cap challenge read data:', JSON.stringify(data))
         let challenge = data.challenge
         // 兼容：如果 challenge 被序列化为字符串则解析
         if (typeof challenge === 'string') {
           try { challenge = JSON.parse(challenge) } catch (e) { return null }
         }
-        if (!challenge || typeof challenge !== 'object') return null
+        if (!challenge || typeof challenge !== 'object') {
+          logger.error('Cap challenge is not an object:', challenge)
+          return null
+        }
         return { challenge, expires: data.expires }
       },
       delete: async (token) => {
