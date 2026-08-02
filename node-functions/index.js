@@ -47,7 +47,6 @@ import {
 import { postCheckSpam as originalPostCheckSpam } from 'twikoo-func/utils/spam'
 import { sendNotice, emailTest } from 'twikoo-func/utils/notify'
 import { generateText } from '@xsai/generate-text'
-import Cap from '@cap.js/server'
 
 // ==================== 垃圾评论检测（含 LLM 反垃圾） ====================
 
@@ -2268,7 +2267,6 @@ const CAP_CHALLENGE_OPTS = {
 }
 
 // 基于 Supabase 的 Cap 存储适配器（用于内嵌模式跨实例共享状态）
-// 注意：challenge 字段需要 JSON 序列化，因为 Supabase 可能对 jsonb 列处理不一致
 function createCapStorage(supabaseClient) {
   return {
     challenges: {
@@ -2288,7 +2286,6 @@ function createCapStorage(supabaseClient) {
           .gt('expires', Date.now())
           .single()
         if (error || !data) return null
-        // challenge 可能是 JSON 字符串（text 列）或对象（jsonb 列），统一处理
         let challenge = data.challenge
         if (typeof challenge === 'string') {
           try { challenge = JSON.parse(challenge) } catch (e) { return null }
@@ -2331,24 +2328,72 @@ function createCapStorage(supabaseClient) {
   }
 }
 
-// 创建 Cap 实例（内嵌模式使用 Supabase 存储）
-function createCap(config) {
-  const isBuiltin = config && config.CAPTCHA_PROVIDER === 'Cap' && !config.CAP_API_ENDPOINT
-  if (!isBuiltin) return null
-  return new Cap({
-    noFSState: true,
-    storage: createCapStorage(supabase)
+// 生成内嵌 Cap 挑战（直接使用 Supabase，绕过 Cap 内存状态）
+async function capChallenge() {
+  if (config.CAPTCHA_PROVIDER !== 'Cap' || config.CAP_API_ENDPOINT) {
+    return { code: RES_CODE.FAIL, message: '内嵌 Cap 未启用' }
+  }
+  const storage = createCapStorage(supabase)
+  const crypto = require('crypto')
+  const challenges = Array.from(
+    { length: CAP_CHALLENGE_OPTS.challengeCount },
+    () => [
+      crypto.randomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeSize / 2))
+        .toString('hex').slice(0, CAP_CHALLENGE_OPTS.challengeSize),
+      crypto.randomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeDifficulty / 2))
+        .toString('hex').slice(0, CAP_CHALLENGE_OPTS.challengeDifficulty)
+    ]
+  )
+  const token = crypto.randomBytes(25).toString('hex')
+  const expires = Date.now() + CAP_CHALLENGE_OPTS.expiresMs
+  await storage.challenges.store(token, { challenge: challenges, expires })
+  return { code: RES_CODE.SUCCESS, data: { challenge: challenges, token, expires } }
+}
+
+// 兑换内嵌 Cap 挑战（直接使用 Supabase）
+async function capRedeem(event) {
+  if (config.CAPTCHA_PROVIDER !== 'Cap' || config.CAP_API_ENDPOINT) {
+    return { code: RES_CODE.FAIL, message: '内嵌 Cap 未启用' }
+  }
+  const token = event && event.token
+  const solutions = event && event.solutions
+  if (!token || !solutions || !Array.isArray(solutions)) {
+    return { code: RES_CODE.FAIL, message: '缺少 token 或 solutions' }
+  }
+  const storage = createCapStorage(supabase)
+  const challengeData = await storage.challenges.read(token)
+  if (!challengeData || challengeData.expires < Date.now()) {
+    await storage.challenges.delete(token)
+    return { code: RES_CODE.FAIL, message: 'Challenge expired' }
+  }
+  await storage.challenges.delete(token)
+  const crypto = require('crypto')
+  const isValid = challengeData.challenge.every(([salt, target]) => {
+    const solution = solutions.find(([s, t]) => s === salt && t === target)
+    return solution && crypto.createHash('sha256').update(salt + solution[2]).digest('hex').startsWith(target)
   })
+  if (!isValid) {
+    return { code: RES_CODE.FAIL, message: 'Invalid solution' }
+  }
+  const vertoken = crypto.randomBytes(15).toString('hex')
+  const expires = Date.now() + 20 * 60 * 1000
+  const hash = crypto.createHash('sha256').update(vertoken).digest('hex')
+  const id = crypto.randomBytes(8).toString('hex')
+  const tokenKey = `${id}:${hash}`
+  await storage.tokens.store(tokenKey, expires)
+  return { code: RES_CODE.SUCCESS, data: { success: true, token: `${id}:${vertoken}`, expires } }
 }
 
 // 校验 Cap 验证码（支持内嵌模式和外部 Standalone 模式）
-async function checkCapCaptcha({ capToken, capSecretKey, capApiEndpoint, cap }) {
+async function checkCapCaptcha({ capToken, capSecretKey, capApiEndpoint, isBuiltin }) {
   try {
-    // 内嵌模式：直接 validateToken
-    if (cap) {
+    // 内嵌模式：直接从 Supabase 验证 token
+    if (isBuiltin) {
       if (!capToken) throw new Error('Cap 验证码 token 不能为空')
-      const { success } = await cap.validateToken(capToken)
-      if (!success) throw new Error('Cap 验证码错误')
+      const storage = createCapStorage(supabase)
+      const expires = await storage.tokens.get(capToken)
+      if (!expires) throw new Error('Cap 验证码错误或已过期')
+      await storage.tokens.delete(capToken)
       return
     }
     // 外部 Cap Standalone：HTTP siteverify
@@ -2370,31 +2415,6 @@ async function checkCapCaptcha({ capToken, capSecretKey, capApiEndpoint, cap }) 
   }
 }
 
-// 生成内嵌 Cap 挑战
-async function capChallenge() {
-  if (config.CAPTCHA_PROVIDER !== 'Cap' || config.CAP_API_ENDPOINT) {
-    return { code: RES_CODE.FAIL, message: '内嵌 Cap 未启用' }
-  }
-  const cap = createCap(config)
-  const data = await cap.createChallenge(CAP_CHALLENGE_OPTS)
-  return { code: RES_CODE.SUCCESS, data }
-}
-
-// 兑换内嵌 Cap 挑战
-async function capRedeem(event) {
-  if (config.CAPTCHA_PROVIDER !== 'Cap' || config.CAP_API_ENDPOINT) {
-    return { code: RES_CODE.FAIL, message: '内嵌 Cap 未启用' }
-  }
-  const token = event && event.token
-  const solutions = event && event.solutions
-  if (!token || !solutions || !Array.isArray(solutions)) {
-    return { code: RES_CODE.FAIL, message: '缺少 token 或 solutions' }
-  }
-  const cap = createCap(config)
-  const data = await cap.redeemChallenge({ token, solutions })
-  return { code: RES_CODE.SUCCESS, data }
-}
-
 async function checkCaptcha(event, ip) {
   const provider = config.CAPTCHA_PROVIDER
   if (provider === 'Turnstile' && config.TURNSTILE_SITE_KEY && config.TURNSTILE_SECRET_KEY) {
@@ -2408,13 +2428,14 @@ async function checkCaptcha(event, ip) {
     await checkCapCaptcha({
       capToken: event.capToken,
       capSecretKey: config.CAP_SECRET_KEY,
-      capApiEndpoint: config.CAP_API_ENDPOINT
+      capApiEndpoint: config.CAP_API_ENDPOINT,
+      isBuiltin: false
     })
   } else if (provider === 'Cap' && !config.CAP_API_ENDPOINT) {
     // 内嵌 Cap 模式
     await checkCapCaptcha({
       capToken: event.capToken,
-      cap: createCap(config)
+      isBuiltin: true
     })
   }
 }
