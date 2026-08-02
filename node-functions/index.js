@@ -603,7 +603,14 @@ const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 
 // 创建 Supabase 客户端
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+// EdgeOne 云端运行时没有全局 WebSocket（Node < 22 无原生实现），而 SupabaseClient
+// 构造时会初始化 RealtimeClient 并调用 WebSocketFactory 探测全局 WebSocket，导致崩溃。
+// Twikoo 不使用 Realtime 实时订阅功能，因此传入空 transport 占位，跳过 WebSocket 探测。
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  realtime: {
+    transport: class NoopWebSocket {}
+  }
+})
 
 // 注入自定义依赖（对标 Cloudflare 版本）
 setCustomLibs({
