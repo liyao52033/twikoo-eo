@@ -2335,6 +2335,8 @@ async function capChallenge() {
     throw new Error('内嵌 Cap 未启用')
   }
   const storage = createCapStorage(supabase)
+  // 清理过期的 challenge
+  await storage.challenges.deleteExpired()
   const crypto = require('crypto')
   const challenges = Array.from(
     { length: CAP_CHALLENGE_OPTS.challengeCount },
