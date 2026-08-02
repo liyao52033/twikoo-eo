@@ -2345,6 +2345,16 @@ function createCapStorage(supabaseClient) {
   }
 }
 
+// EdgeOne 运行时 Uint8Array.toString('hex') 不会转成十六进制字符串
+// 手动实现 bytes → hex 转换，兼容 Buffer 和 Uint8Array
+function bytesToHex (bytes) {
+  let hex = ''
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0')
+  }
+  return hex
+}
+
 // 生成内嵌 Cap 挑战（直接使用 Supabase，绕过 Cap 内存状态）
 async function capChallenge() {
   if (config.CAPTCHA_PROVIDER !== 'Cap' || config.CAP_API_ENDPOINT) {
@@ -2357,13 +2367,13 @@ async function capChallenge() {
   const challenges = Array.from(
     { length: CAP_CHALLENGE_OPTS.challengeCount },
     () => [
-      crypto.randomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeSize / 2))
-        .toString('hex').slice(0, CAP_CHALLENGE_OPTS.challengeSize),
-      crypto.randomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeDifficulty / 2))
-        .toString('hex').slice(0, CAP_CHALLENGE_OPTS.challengeDifficulty)
+      bytesToHex(crypto.randomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeSize / 2)))
+        .slice(0, CAP_CHALLENGE_OPTS.challengeSize),
+      bytesToHex(crypto.randomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeDifficulty / 2)))
+        .slice(0, CAP_CHALLENGE_OPTS.challengeDifficulty)
     ]
   )
-  const token = crypto.randomBytes(25).toString('hex')
+  const token = bytesToHex(crypto.randomBytes(25))
   const expires = Date.now() + CAP_CHALLENGE_OPTS.expiresMs
   await storage.challenges.store(token, { challenge: challenges, expires })
   // 返回格式与 twikoo-func 一致：{ code, challenge, token, expires }
