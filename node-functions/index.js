@@ -2271,12 +2271,17 @@ function createCapStorage(supabaseClient) {
   return {
     challenges: {
       store: async (token, data) => {
+        logger.log('Cap challenge store - token:', token)
+        logger.log('Cap challenge store - data.challenge type:', typeof data.challenge, 'isArray:', Array.isArray(data.challenge))
+        logger.log('Cap challenge store - data.challenge length:', data.challenge?.length)
+        logger.log('Cap challenge store - first element:', JSON.stringify(data.challenge?.[0]))
         const { error } = await supabaseClient.from('cap_challenges').upsert({
           token,
           challenge: data.challenge,
           expires: data.expires
         }, { onConflict: 'token' })
         if (error) logger.error('Cap challenge store error:', error.message)
+        else logger.log('Cap challenge stored successfully')
       },
       read: async (token) => {
         const { data, error } = await supabaseClient
@@ -2286,14 +2291,21 @@ function createCapStorage(supabaseClient) {
           .gt('expires', Date.now())
           .single()
         if (error || !data) return null
-        logger.log('Cap challenge read data:', JSON.stringify(data))
+        logger.log('Cap challenge read - raw data.challenge type:', typeof data.challenge)
+        logger.log('Cap challenge read - raw data.challenge value:', JSON.stringify(data.challenge))
+        logger.log('Cap challenge read - isArray:', Array.isArray(data.challenge))
         let challenge = data.challenge
         // 兼容：如果 challenge 被序列化为字符串则解析
         if (typeof challenge === 'string') {
           try { challenge = JSON.parse(challenge) } catch (e) { return null }
         }
+        logger.log('Cap challenge read - after parse, type:', typeof challenge, 'isArray:', Array.isArray(challenge))
         if (!challenge || typeof challenge !== 'object') {
           logger.error('Cap challenge is not an object:', challenge)
+          return null
+        }
+        if (!Array.isArray(challenge)) {
+          logger.error('Cap challenge is not an array! Type:', typeof challenge, 'Value:', JSON.stringify(challenge))
           return null
         }
         return { challenge, expires: data.expires }
@@ -2354,8 +2366,8 @@ async function capChallenge() {
   const token = crypto.randomBytes(25).toString('hex')
   const expires = Date.now() + CAP_CHALLENGE_OPTS.expiresMs
   await storage.challenges.store(token, { challenge: challenges, expires })
-  // 返回前端 Cap.js 客户端期望的扁平格式
-  return { challenge: challenges, token, expires }
+  // 返回格式与 twikoo-func 一致：{ code, challenge, token, expires }
+  return { code: RES_CODE.SUCCESS, challenge: challenges, token, expires }
 }
 
 // 兑换内嵌 Cap 挑战（直接使用 Supabase）
@@ -2389,7 +2401,7 @@ async function capRedeem(event) {
   const id = crypto.randomBytes(8).toString('hex')
   const tokenKey = `${id}:${hash}`
   await storage.tokens.store(tokenKey, expires)
-  return { code: RES_CODE.SUCCESS, data: { success: true, token: `${id}:${vertoken}`, expires } }
+  return { code: RES_CODE.SUCCESS, success: true, token: `${id}:${vertoken}`, expires }
 }
 
 // 校验 Cap 验证码（支持内嵌模式和外部 Standalone 模式）
