@@ -24,8 +24,10 @@
     "deploy": "rm -rf .edgeone && edgeone makers deploy -n twikoo"
   },
   "dependencies": {
+    "@cap.js/server": "^1.0.0",
     "@imaegoo/node-ip2region": "^2.1.1",
     "@supabase/supabase-js": "^2.111.0",
+    "@xsai/generate-text": "^0.5.0-beta.7",
     "bowser": "^2.14.1",
     "pako": "^3.0.1",
     "resend": "^6.18.1",

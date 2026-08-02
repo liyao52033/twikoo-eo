@@ -2268,13 +2268,14 @@ const CAP_CHALLENGE_OPTS = {
 }
 
 // 基于 Supabase 的 Cap 存储适配器（用于内嵌模式跨实例共享状态）
+// 注意：challenge 字段需要 JSON 序列化，因为 Supabase 可能对 jsonb 列处理不一致
 function createCapStorage(supabaseClient) {
   return {
     challenges: {
       store: async (token, data) => {
         const { error } = await supabaseClient.from('cap_challenges').upsert({
           token,
-          challenge: data.challenge,
+          challenge: JSON.stringify(data.challenge),
           expires: data.expires
         }, { onConflict: 'token' })
         if (error) logger.error('Cap challenge store error:', error.message)
@@ -2287,7 +2288,13 @@ function createCapStorage(supabaseClient) {
           .gt('expires', Date.now())
           .single()
         if (error || !data) return null
-        return { challenge: data.challenge, expires: data.expires }
+        // challenge 可能是 JSON 字符串（text 列）或对象（jsonb 列），统一处理
+        let challenge = data.challenge
+        if (typeof challenge === 'string') {
+          try { challenge = JSON.parse(challenge) } catch (e) { return null }
+        }
+        if (!challenge || typeof challenge !== 'object') return null
+        return { challenge, expires: data.expires }
       },
       delete: async (token) => {
         await supabaseClient.from('cap_challenges').delete().eq('token', token)
