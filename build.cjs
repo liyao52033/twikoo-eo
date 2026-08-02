@@ -96,6 +96,45 @@ for (const pkg of packagesToOverwrite) {
 console.log(`  共覆写 ${overwriteCount} 个文件`)
 console.log('')
 
+// 覆写 xsschema 的可选适配器文件
+// xsschema 在 dist 中通过 import('effect') / import('sury') / import('@valibot/to-json-schema')
+// 动态加载其 optional peerDependencies。EdgeOne 云端 npm install 不会安装这些可选依赖，
+// 导致 esbuild 打包时无法解析对应裸模块而构建失败。
+// 这些 adapter 属于 toJsonSchema 的高级功能，Twikoo 运行时不会调用，直接覆写为抛错模块。
+console.log('步骤 1.5: 覆写 xsschema 可选适配器...')
+const xsschemaDistDir = path.join(srcDir, 'node_modules/xsschema/dist')
+const adapterPrefixes = ['effect-', 'sury-', 'valibot-']
+
+if (fs.existsSync(xsschemaDistDir)) {
+  const adapterFiles = fs.readdirSync(xsschemaDistDir).filter((file) => {
+    return adapterPrefixes.some((prefix) => file.startsWith(prefix) && file.endsWith('.js'))
+  })
+  for (const file of adapterFiles) {
+    const filePath = path.join(xsschemaDistDir, file)
+    // 备份原文件（如果还没备份）
+    const backupPath = filePath + '.backup'
+    if (!fs.existsSync(backupPath)) {
+      fs.copyFileSync(filePath, backupPath)
+    }
+    const adapterName = file.split('-')[0]
+    fs.writeFileSync(filePath, `// Overwritten for EdgeOne Pages compatibility
+// The optional peer dependency "${adapterName}" is not installed in the EdgeOne build
+// environment, which would cause esbuild to fail resolving the dynamic import().
+export const getToJsonSchemaFn = async () => {
+  throw new Error('xsschema: ${adapterName} adapter is not supported in EdgeOne Pages environment')
+}
+`)
+    console.log(`  ✓ 已覆写: node_modules/xsschema/dist/${file}`)
+    overwriteCount++
+  }
+  if (adapterFiles.length === 0) {
+    console.log('  - 未找到需要覆写的适配器文件（已处理过？）')
+  }
+} else {
+  console.log('  - 跳过（不存在）: node_modules/xsschema')
+}
+console.log('')
+
 // 检查必要文件
 console.log('步骤 2: 检查项目文件...')
 const requiredFiles = [
