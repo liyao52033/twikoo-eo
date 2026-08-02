@@ -463,14 +463,22 @@ function getSignatureKey(key, dateStamp, regionName, serviceName) {
   return kSigning
 }
 
-function hmacSHA256(key, data) {
-  const crypto = require('crypto')
-  return crypto.createHmac('sha256', key).update(data).digest()
+async function hmacSHA256(key, data) {
+  const keyData = typeof key === 'string' ? new TextEncoder().encode(key) : key
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    keyData,
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, data)
+  return new Uint8Array(signature)
 }
 
-function sha256Hash(data) {
-  const crypto = require('crypto')
-  return crypto.createHash('sha256').update(data).digest('hex')
+async function sha256Hash(data) {
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+  return new Uint8Array(hashBuffer)
 }
 
 function toHex(buffer) {
@@ -607,7 +615,14 @@ async function uploadImageToS3(photo, fileName, config) {
       'x-amz-content-sha256': payloadHash,
       'Authorization': authorization
     },
-    body: bytes
+    body: bytes,
+    eo: {
+      timeoutSetting: {
+        connectTimeout: 60000,  // 连接超时 60s
+        readTimeout: 60000,     // 读取超时 60s
+        writeTimeout: 60000,    // 写入超时 60s
+      }
+    }
   })
 
   if (!response.ok) {
@@ -2345,6 +2360,20 @@ function createCapStorage(supabaseClient) {
   }
 }
 
+// EdgeOne Pages 使用 Web Crypto API
+function getRandomBytes(size) {
+  const bytes = new Uint8Array(size)
+  crypto.getRandomValues(bytes)
+  return bytes
+}
+
+async function sha256Hex(message) {
+  const msgBuffer = new TextEncoder().encode(message)
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer)
+  const hashArray = Array.from(new Uint8Array(hashBuffer))
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('')
+}
+
 // EdgeOne 运行时 Uint8Array.toString('hex') 不会转成十六进制字符串
 // 手动实现 bytes → hex 转换，兼容 Buffer 和 Uint8Array
 function bytesToHex (bytes) {
@@ -2363,19 +2392,41 @@ async function capChallenge() {
   const storage = createCapStorage(supabase)
   // 清理过期的 challenge
   await storage.challenges.deleteExpired()
-  const crypto = require('crypto')
-  const challenges = Array.from(
-    { length: CAP_CHALLENGE_OPTS.challengeCount },
-    () => [
-      bytesToHex(crypto.randomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeSize / 2)))
-        .slice(0, CAP_CHALLENGE_OPTS.challengeSize),
-      bytesToHex(crypto.randomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeDifficulty / 2)))
-        .slice(0, CAP_CHALLENGE_OPTS.challengeDifficulty)
-    ]
-  )
-  const token = bytesToHex(crypto.randomBytes(25))
+
+  logger.log('开始生成 challenges...')
+  const challenges = []
+
+  for (let i = 0; i < CAP_CHALLENGE_OPTS.challengeCount; i++) {
+    try {
+      const saltBytes = getRandomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeSize / 2))
+      logger.log(`Challenge ${i}: saltBytes type =`, typeof saltBytes, 'isArray =', Array.isArray(saltBytes), 'length =', saltBytes?.length)
+
+      const saltHex = bytesToHex(saltBytes).slice(0, CAP_CHALLENGE_OPTS.challengeSize)
+      logger.log(`Challenge ${i}: saltHex =`, saltHex)
+
+      const targetBytes = getRandomBytes(Math.ceil(CAP_CHALLENGE_OPTS.challengeDifficulty / 2))
+      logger.log(`Challenge ${i}: targetBytes type =`, typeof targetBytes, 'isArray =', Array.isArray(targetBytes), 'length =', targetBytes?.length)
+
+      const targetHex = bytesToHex(targetBytes).slice(0, CAP_CHALLENGE_OPTS.challengeDifficulty)
+      logger.log(`Challenge ${i}: targetHex =`, targetHex)
+
+      challenges.push([saltHex, targetHex])
+    } catch (error) {
+      logger.error(`生成 challenge ${i} 时出错:`, error)
+      throw error
+    }
+  }
+
+  logger.log('challenges 生成完成，数量:', challenges.length)
+  logger.log('第一个 challenge:', JSON.stringify(challenges[0]))
+
+  const token = bytesToHex(getRandomBytes(25))
   const expires = Date.now() + CAP_CHALLENGE_OPTS.expiresMs
+
+  logger.log('准备存储 challenge，token:', token)
   await storage.challenges.store(token, { challenge: challenges, expires })
+  logger.log('challenge 存储成功')
+
   // 返回格式与 twikoo-func 一致：{ code, challenge, token, expires }
   return { code: RES_CODE.SUCCESS, challenge: challenges, token, expires }
 }
@@ -2397,18 +2448,17 @@ async function capRedeem(event) {
     return { code: RES_CODE.FAIL, message: 'Challenge expired' }
   }
   await storage.challenges.delete(token)
-  const crypto = require('crypto')
   const isValid = challengeData.challenge.every(([salt, target]) => {
     const solution = solutions.find(([s, t]) => s === salt && t === target)
-    return solution && crypto.createHash('sha256').update(salt + solution[2]).digest('hex').startsWith(target)
+    return solution && sha256Hex(salt + solution[2]).then(hash => hash.startsWith(target))
   })
   if (!isValid) {
     return { code: RES_CODE.FAIL, message: 'Invalid solution' }
   }
-  const vertoken = crypto.randomBytes(15).toString('hex')
+  const vertoken = bytesToHex(getRandomBytes(15))
   const expires = Date.now() + 20 * 60 * 1000
-  const hash = crypto.createHash('sha256').update(vertoken).digest('hex')
-  const id = crypto.randomBytes(8).toString('hex')
+  const hash = await sha256Hex(vertoken)
+  const id = bytesToHex(getRandomBytes(8))
   const tokenKey = `${id}:${hash}`
   await storage.tokens.store(tokenKey, expires)
   return { code: RES_CODE.SUCCESS, success: true, token: `${id}:${vertoken}`, expires }
