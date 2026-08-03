@@ -524,7 +524,7 @@ node build.cjs
 
 **项目结构说明：**
 ```
-├── node-functions/
+├── cloud-functions/
 │   ├── index.js               # Node Function 主入口（处理评论逻辑）
 │   ├── ip2region-searcher.js  # IP 归属地查询器（纯内存实现）
 │   ├── ip2region-data.js      # IP 数据库（构建时自动生成）
@@ -535,7 +535,7 @@ node build.cjs
 ```
 
 **架构说明：**
-- **Node Function (`node-functions/index.js`)**: 运行在 Node.js 环境，处理评论业务逻辑、邮件通知等
+- **Node Function (`cloud-functions/index.js`)**: 运行在 Node.js 环境，处理评论业务逻辑、邮件通知等
 - **数据库**: 使用 Supabase PostgreSQL 数据库存储评论数据
 - **自定义功能**:
   - 多种图床上传支持（GitHub、S3、兰空图床等）
