@@ -697,6 +697,41 @@ async function uploadImageToEasyImage(photo, fileName, config) {
 }
 
 /**
+ * NSFW 图片检测（移植自 twikoo-func，改用 Blob + 原生 fetch 兼容 EdgeOne）
+ * 检测失败时放行上传，与官方行为一致
+ */
+async function checkNsfw({ photo, config }) {
+  const result = { rejected: false, message: '' }
+  try {
+    const threshold = parseFloat(config.NSFW_THRESHOLD) || 0.5
+    const apiUrl = config.NSFW_API_URL.replace(/\/$/, '')
+    const blob = base64ToBlob(photo, 'nsfw_check.jpg')
+    const formData = new FormData()
+    formData.append('image', blob, 'nsfw_check.jpg')
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 30000)
+    const response = await fetch(`${apiUrl}/classify`, {
+      method: 'POST',
+      body: formData,
+      signal: controller.signal
+    })
+    clearTimeout(timer)
+    const scores = await response.json()
+    if (scores && typeof scores === 'object') {
+      const nsfwScore = (scores.porn || 0) + (scores.hentai || 0) + (scores.sexy || 0)
+      logger.info('NSFW检测分数:', nsfwScore, '阈值:', threshold)
+      if (nsfwScore > threshold) {
+        result.rejected = true
+        result.message = `图片包含不当内容，检测分数 ${nsfwScore.toFixed(3)} 超过阈值 ${threshold}, 上传已被拒绝`
+      }
+    }
+  } catch (e) {
+    logger.error('NSFW检测失败:', e.message)
+  }
+  return result
+}
+
+/**
  * 主上传函数 - 兼容 EdgeOne 环境
  */
 async function uploadImage(event, config) {
@@ -706,6 +741,16 @@ async function uploadImage(event, config) {
   try {
     if (!config.IMAGE_CDN) {
       throw new Error('未配置图片上传服务 (IMAGE_CDN)')
+    }
+
+    // NSFW 检测：配置了 NSFW_API_URL 时先检测，超阈值拒绝上传
+    if (config.NSFW_API_URL) {
+      const nsfwResult = await checkNsfw({ photo, config })
+      if (nsfwResult.rejected) {
+        res.code = RES_CODE.NSFW_REJECTED
+        res.err = nsfwResult.message
+        return res
+      }
     }
 
     // tip: qcloud 图床也支持后端上传
@@ -726,6 +771,10 @@ async function uploadImage(event, config) {
       const result = await uploadImageToLskyPro(photo, fileName, config, config.IMAGE_CDN)
       res.data = result.data
     } else if (config.IMAGE_CDN === 'lskypro') {
+      // if (!config.IMAGE_CDN_URL) {
+      //   throw new Error('未配置兰空图床 URL (IMAGE_CDN_URL)')
+      // }
+      // const result = await uploadImageToLskyPro(photo, fileName, config, config.IMAGE_CDN_URL)
       const result = await uploadImageToGitHub(photo, fileName, config)
       res.data = result.data
     } else if (config.IMAGE_CDN === 'piclist') {
