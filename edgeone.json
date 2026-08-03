@@ -1,3 +1,13 @@
 {
-  "nodeVersion": "22"
+  "cloudFunctions": {
+    "nodejs": {
+      "maxDuration": 60
+    },
+    "python": {
+      "maxDuration": 60
+    },
+    "go": {
+      "maxDuration": 60
+    }
+  }
 }
