@@ -2473,10 +2473,17 @@ async function checkCapCaptcha({ capToken, capSecretKey, capApiEndpoint, isBuilt
     // 内嵌模式：直接从 Supabase 验证 token
     if (isBuiltin) {
       if (!capToken) throw new Error('Cap 验证码 token 不能为空')
+      // 客户端 token 格式为 id:vertoken，存储 key 为 id:sha256(vertoken)
+      const sepIdx = String(capToken).indexOf(':')
+      const id = String(capToken).slice(0, sepIdx)
+      const vertoken = String(capToken).slice(sepIdx + 1)
+      if (!id || !vertoken) throw new Error('Cap 验证码 token 格式错误')
+      const hash = await sha256Hex(vertoken)
+      const tokenKey = `${id}:${hash}`
       const storage = createCapStorage(supabase)
-      const expires = await storage.tokens.get(capToken)
+      const expires = await storage.tokens.get(tokenKey)
       if (!expires) throw new Error('Cap 验证码错误或已过期')
-      await storage.tokens.delete(capToken)
+      await storage.tokens.delete(tokenKey)
       return
     }
     // 外部 Cap Standalone：HTTP siteverify
