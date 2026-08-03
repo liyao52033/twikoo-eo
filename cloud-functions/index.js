@@ -455,16 +455,17 @@ async function uploadImageToGitHub(photo, fileName, config) {
 /**
  * AWS Signature V4 签名辅助函数
  */
-function getSignatureKey(key, dateStamp, regionName, serviceName) {
-  const kDate = hmacSHA256(`AWS4${key}`, dateStamp)
-  const kRegion = hmacSHA256(kDate, regionName)
-  const kService = hmacSHA256(kRegion, serviceName)
-  const kSigning = hmacSHA256(kService, 'aws4_request')
+async function getSignatureKey(key, dateStamp, regionName, serviceName) {
+  const kDate = await hmacSHA256(`AWS4${key}`, dateStamp)
+  const kRegion = await hmacSHA256(kDate, regionName)
+  const kService = await hmacSHA256(kRegion, serviceName)
+  const kSigning = await hmacSHA256(kService, 'aws4_request')
   return kSigning
 }
 
 async function hmacSHA256(key, data) {
   const keyData = typeof key === 'string' ? new TextEncoder().encode(key) : key
+  const dataBuf = typeof data === 'string' ? new TextEncoder().encode(data) : data
   const cryptoKey = await crypto.subtle.importKey(
     'raw',
     keyData,
@@ -472,17 +473,23 @@ async function hmacSHA256(key, data) {
     false,
     ['sign']
   )
-  const signature = await crypto.subtle.sign('HMAC', cryptoKey, data)
+  const signature = await crypto.subtle.sign('HMAC', cryptoKey, dataBuf)
   return new Uint8Array(signature)
 }
 
 async function sha256Hash(data) {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+  const input = typeof data === 'string' ? new TextEncoder().encode(data) : data
+  const hashBuffer = await crypto.subtle.digest('SHA-256', input)
   return new Uint8Array(hashBuffer)
 }
 
 function toHex(buffer) {
-  return buffer.toString('hex')
+  // EdgeOne 运行时 Uint8Array.toString('hex') 无效，手动转换
+  let hex = ''
+  for (let i = 0; i < buffer.length; i++) {
+    hex += buffer[i].toString(16).padStart(2, '0')
+  }
+  return hex
 }
 
 /**
@@ -549,7 +556,11 @@ async function uploadImageToS3(photo, fileName, config) {
   let s3Base, endpoint
   if (endpointBase) {
     // 自定义 S3 Endpoint（R2 / MinIO / COS / OSS 等）
-    s3Base = forcePathStyle ? `${endpointBase}/${bucket}` : endpointBase
+    // 若 endpoint 域名已包含 bucket（virtual-hosted style，如腾讯云 COS 的
+    // https://bucket-appid.cos.region.myqcloud.com），则不能再把 bucket 拼进路径
+    const endpointHost = new URL(endpointBase).host
+    const isVirtualHosted = endpointHost === bucket || endpointHost.startsWith(`${bucket}.`)
+    s3Base = (forcePathStyle && !isVirtualHosted) ? `${endpointBase}/${bucket}` : endpointBase
     endpoint = `${s3Base}/${key}`
   } else {
     // 标准 AWS S3 virtual-hosted-style
@@ -574,7 +585,7 @@ async function uploadImageToS3(photo, fileName, config) {
   const now = new Date()
   const dateStamp = now.toISOString().slice(0, 10).replace(/-/g, '')
   const timeStamp = now.toISOString().replace(/[:-]/g, '').slice(0, 15) + 'Z'
-  const payloadHash = sha256Hash(Buffer.from(bytes))
+  const payloadHash = toHex(await sha256Hash(bytes))
 
   const signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date'
   const canonicalHeaders = [
@@ -598,11 +609,11 @@ async function uploadImageToS3(photo, fileName, config) {
     'AWS4-HMAC-SHA256',
     timeStamp,
     credentialScope,
-    sha256Hash(canonicalRequest)
+    toHex(await sha256Hash(canonicalRequest))
   ].join('\n')
 
-  const signingKey = getSignatureKey(secretAccessKey, dateStamp, region, 's3')
-  const signature = toHex(hmacSHA256(signingKey, stringToSign))
+  const signingKey = await getSignatureKey(secretAccessKey, dateStamp, region, 's3')
+  const signature = toHex(await hmacSHA256(signingKey, stringToSign))
   const authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
 
   // 6. 发送 PUT 请求
