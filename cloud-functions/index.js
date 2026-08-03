@@ -726,10 +726,7 @@ async function uploadImage(event, config) {
       const result = await uploadImageToLskyPro(photo, fileName, config, config.IMAGE_CDN)
       res.data = result.data
     } else if (config.IMAGE_CDN === 'lskypro') {
-      if (!config.IMAGE_CDN_URL) {
-        throw new Error('未配置兰空图床 URL (IMAGE_CDN_URL)')
-      }
-      const result = await uploadImageToLskyPro(photo, fileName, config, config.IMAGE_CDN_URL)
+      const result = await uploadImageToGitHub(photo, fileName, config)
       res.data = result.data
     } else if (config.IMAGE_CDN === 'piclist') {
       if (!config.IMAGE_CDN_URL) {
