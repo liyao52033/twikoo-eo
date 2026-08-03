@@ -704,7 +704,10 @@ async function checkNsfw({ photo, config }) {
   const result = { rejected: false, message: '' }
   try {
     const threshold = parseFloat(config.NSFW_THRESHOLD) || 0.5
-    const apiUrl = config.NSFW_API_URL.replace(/\/$/, '')
+    let apiUrl = config.NSFW_API_URL.trim()
+    // 兼容裸域名配置（如 a.b.com），自动补 https://
+    if (!/^https?:\/\//i.test(apiUrl)) apiUrl = `https://${apiUrl}`
+    apiUrl = apiUrl.replace(/\/$/, '')
     const blob = base64ToBlob(photo, 'nsfw_check.jpg')
     const formData = new FormData()
     formData.append('image', blob, 'nsfw_check.jpg')
